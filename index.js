@@ -28,15 +28,20 @@ const {
   NoSubscriberBehavior
 } = require('@discordjs/voice');
 
-const googleTTS = require('google-tts-api');
-
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = process.env.PREFIX || 'ry!';
 const VERIFIED_ROLE_NAME =
   process.env.VERIFIED_ROLE_NAME || 'Verified';
 const STAFF_ROLE_NAME =
   process.env.STAFF_ROLE_NAME || 'Staff';
-const TTS_LANGUAGE = process.env.TTS_LANGUAGE || 'id';
+
+// Lokasi file mp3 welcome (opsional, bisa relatif ke folder ROOT atau absolut).
+// Kalau kosong, bot otomatis nyari welcome.mp3 di beberapa lokasi umum.
+const WELCOME_AUDIO_PATH = process.env.WELCOME_AUDIO_PATH || '';
+
+// Batas maksimal nunggu audio selesai (detik), buat jaga-jaga kalau macet.
+const WELCOME_MAX_SECONDS =
+  Number(process.env.WELCOME_MAX_SECONDS) || 300;
 
 if (!TOKEN) {
   console.error('Isi DISCORD_TOKEN di file .env!');
@@ -346,35 +351,39 @@ async function setupAll(guild) {
 }
 
 // ===============================
-// AUDIO TTS
+// AUDIO WELCOME (MP3)
 // ===============================
 
-async function speakWelcome(channel, text) {
-  const audioUrl = googleTTS.getAudioUrl(
-    text.slice(0, 190),
-    {
-      lang: TTS_LANGUAGE,
-      slow: false,
-      host: 'https://translate.google.com'
-    }
-  );
+// Cari file welcome.mp3. Urutan pengecekan:
+// 1. WELCOME_AUDIO_PATH dari .env (kalau diisi)
+// 2. ROOT/welcome.mp3, ROOT/assets/welcome.mp3, ROOT/audio/welcome.mp3
+// 3. folder yang sama dengan index.js (+ subfolder assets)
+function resolveWelcomeAudio() {
+  const candidates = [
+    WELCOME_AUDIO_PATH
+      ? path.resolve(ROOT, WELCOME_AUDIO_PATH)
+      : null,
+    path.join(ROOT, 'welcome.mp3'),
+    path.join(ROOT, 'assets', 'welcome.mp3'),
+    path.join(ROOT, 'audio', 'welcome.mp3'),
+    path.join(__dirname, 'welcome.mp3'),
+    path.join(__dirname, 'assets', 'welcome.mp3')
+  ].filter(Boolean);
 
-  const response = await fetch(audioUrl);
+  return candidates.find(file => fs.existsSync(file)) || null;
+}
 
-  if (!response.ok) {
-    throw new Error('Gagal mengambil audio TTS.');
+// Join voice, muter welcome.mp3 sampai habis, lalu keluar.
+// Promise baru resolve SETELAH audio selesai diputar.
+// Kalau gagal (file ga ada, ffmpeg error, timeout) akan throw error.
+async function playWelcomeAudio(channel) {
+  const audioPath = resolveWelcomeAudio();
+
+  if (!audioPath) {
+    throw new Error(
+      'welcome.mp3 tidak ditemukan. Taruh di folder project atau isi WELCOME_AUDIO_PATH di .env.'
+    );
   }
-
-  const bytes = Buffer.from(
-    await response.arrayBuffer()
-  );
-
-  const tempFile = path.join(
-    os.tmpdir(),
-    `ry-tts-${Date.now()}.mp3`
-  );
-
-  fs.writeFileSync(tempFile, bytes);
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
@@ -390,7 +399,7 @@ async function speakWelcome(channel, text) {
     }
   });
 
-  connection.subscribe(player);
+  let timeoutId;
 
   try {
     await entersState(
@@ -399,25 +408,52 @@ async function speakWelcome(channel, text) {
       20000
     );
 
-    player.play(createAudioResource(tempFile));
+    connection.subscribe(player);
 
-    await entersState(
-      player,
-      AudioPlayerStatus.Playing,
-      20000
-    );
+    const finished = new Promise((resolve, reject) => {
+      let started = false;
 
-    await entersState(
-      player,
-      AudioPlayerStatus.Idle,
-      120000
-    );
+      player.on('error', reject);
+
+      player.on('stateChange', (oldState, newState) => {
+        if (newState.status === AudioPlayerStatus.Playing) {
+          started = true;
+        }
+
+        // Audio selesai = pindah dari Playing ke Idle
+        if (
+          started &&
+          newState.status === AudioPlayerStatus.Idle
+        ) {
+          resolve();
+        }
+      });
+
+      // Kalau koneksi voice putus di tengah jalan
+      connection.on('stateChange', (oldState, newState) => {
+        if (newState.status === VoiceConnectionStatus.Destroyed) {
+          reject(new Error('Koneksi voice terputus sebelum audio selesai.'));
+        }
+      });
+    });
+
+    const timeout = new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error('Audio welcome timeout.')),
+        WELCOME_MAX_SECONDS * 1000
+      );
+    });
+
+    player.play(createAudioResource(audioPath));
+
+    await Promise.race([finished, timeout]);
   } finally {
+    clearTimeout(timeoutId);
+    player.removeAllListeners();
     player.stop(true);
-    connection.destroy();
 
     try {
-      fs.unlinkSync(tempFile);
+      connection.destroy();
     } catch {}
   }
 }
@@ -476,15 +512,15 @@ async function processWelcomeQueue(guild) {
       if (!verifiedRole) continue;
 
       try {
-        await speakWelcome(
-          channel,
-          `Halo ${member.displayName}, selamat datang di server kami. Setelah pesan ini selesai, akses server kamu akan dibuka. Terima kasih sudah bergabung.`
-        );
+        // 1. Putar welcome.mp3 sampai selesai
+        await playWelcomeAudio(channel);
 
+        // 2. Setelah selesai, cek lagi member masih di voice
         const refreshed = await guild.members.fetch(
           member.id
         ).catch(() => null);
 
+        // 3. Baru kasih role
         if (
           refreshed &&
           refreshed.voice.channelId === item.channelId &&
@@ -500,7 +536,7 @@ async function processWelcomeQueue(guild) {
           ).catch(() => {});
         }
       } catch (error) {
-        console.error('Welcome TTS gagal:', error);
+        console.error('Welcome audio gagal:', error);
       }
     }
   } finally {
@@ -857,6 +893,16 @@ function parseVouchArgs(content, attachmentUrl) {
 client.once('ready', () => {
   console.log(`RY aktif sebagai ${client.user.tag}`);
 
+  const audioPath = resolveWelcomeAudio();
+
+  if (audioPath) {
+    console.log(`Welcome audio: ${audioPath}`);
+  } else {
+    console.warn(
+      'PERINGATAN: welcome.mp3 tidak ditemukan! Taruh di folder project atau isi WELCOME_AUDIO_PATH di .env.'
+    );
+  }
+
   client.user.setPresence({
     activities: [{ name: 'ry!help | RY Support' }],
     status: 'online'
@@ -926,7 +972,7 @@ client.on('messageCreate', async message => {
         '`ry!setup welcome` — setup welcome',
         '`ry!setup ticket` — setup ticket',
         '`ry!setup vouches` — setup vouches',
-        '`ry!welcome test` — tes audio TTS',
+        '`ry!welcome test` — tes audio welcome.mp3',
         '`ry!vouches <gambar> @buyer <produk> <harga> <done/pending>`',
         '`ry!ticket close` — tutup ticket'
       ].join('\n'));
@@ -994,7 +1040,7 @@ client.on('messageCreate', async message => {
     }
   }
 
-  // TES TTS
+  // TES AUDIO WELCOME (MP3)
   if (
     command === 'welcome' &&
     (args[0] || '').toLowerCase() === 'test'
@@ -1012,17 +1058,17 @@ client.on('messageCreate', async message => {
     }
 
     try {
-      await message.reply('Menjalankan tes TTS...');
+      await message.reply('Memutar welcome.mp3...');
 
-      await speakWelcome(
-        voiceChannel,
-        'Halo, ini adalah tes audio welcome dari bot RY.'
-      );
+      await playWelcomeAudio(voiceChannel);
+
+      await message.channel.send('Tes audio selesai.');
     } catch (error) {
       console.error(error);
 
       await message.reply(
-        'TTS gagal. Periksa FFmpeg dan izin Connect serta Speak.'
+        `Audio gagal: ${error.message}\n` +
+        'Cek juga FFmpeg, izin Connect serta Speak, dan lokasi welcome.mp3.'
       );
     }
 
