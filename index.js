@@ -201,7 +201,7 @@ async function setupWelcome(guild) {
 
   const category = await findOrCreateCategory(
     guild,
-    'RY・WELCOME'
+    '・ー ✧ Introduction ✧ ー・'
   );
 
   const voice = await findOrCreateChannel(
@@ -240,7 +240,7 @@ async function setupTicket(guild) {
 
   const panel = await findOrCreateChannel(
     guild,
-    '🎫・open-ticket',
+    '・ー ✧ Ticket ✧ ー・',
     ChannelType.GuildText,
     {
       parent: category.id,
