@@ -2,7 +2,7 @@
   "name": "ry-discord-bot",
   "version": "1.0.0",
   "description": "RY Discord Bot",
-  "main": "src/index.js",
+  "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
