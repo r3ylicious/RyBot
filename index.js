@@ -235,12 +235,12 @@ async function setupTicket(guild) {
 
   const category = await findOrCreateCategory(
     guild,
-    'RY・TICKETS'
+    '・ー ✧ Ticket ✧ ー・'
   );
 
   const panel = await findOrCreateChannel(
     guild,
-    '・ー ✧ Ticket ✧ ー・',
+    '🎫・open-ticket',
     ChannelType.GuildText,
     {
       parent: category.id,
