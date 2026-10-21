@@ -19,7 +19,10 @@ const {
   AttachmentBuilder,
   ModalBuilder,
   TextInputBuilder,
-  TextInputStyle
+  TextInputStyle,
+  SlashCommandBuilder,
+  ChannelSelectMenuBuilder,
+  RoleSelectMenuBuilder
 } = require('discord.js');
 
 const {
@@ -33,7 +36,6 @@ const {
 } = require('@discordjs/voice');
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const PREFIX = process.env.PREFIX || 'ry!';
 const VERIFIED_ROLE_NAME =
   process.env.VERIFIED_ROLE_NAME || 'Verified';
 const STAFF_ROLE_NAME =
@@ -57,13 +59,15 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildVoiceStates
   ],
   partials: [
     Partials.Channel,
     Partials.GuildMember,
-    Partials.Message
+    Partials.Message,
+    Partials.Reaction,
+    Partials.User
   ]
 });
 
@@ -554,13 +558,261 @@ async function setupGiveaway(guild) {
   return { staffRole, category, rundown, history, setting };
 }
 
+// ===============================
+// SETUP HOOK & REACTION ROLE
+// ===============================
+
+async function getStaffRole(guild) {
+  const cfg = guildConfig(guild.id);
+
+  // Pakai role Staff yang udah ada (lewat ID), jangan bikin dobel
+  const role =
+    (cfg.staffRoleId && guild.roles.cache.get(cfg.staffRoleId)) ||
+    await findOrCreateRole(guild, STAFF_ROLE_NAME, {
+      color: 0x5865f2
+    });
+
+  cfg.staffRoleId = role.id;
+
+  return role;
+}
+
+// Channel panel khusus Staff: member biasa nggak bisa lihat
+function staffOnlyOverwrites(guild, staffRole) {
+  return [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel]
+    },
+    {
+      id: staffRole.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory
+      ],
+      deny: [PermissionFlagsBits.SendMessages]
+    },
+    {
+      id: client.user.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.ReadMessageHistory
+      ]
+    }
+  ];
+}
+
+async function panelAlreadyPosted(channel, customId) {
+  const recent = await channel.messages.fetch({
+    limit: 20
+  }).catch(() => null);
+
+  return Boolean(
+    recent?.some(message =>
+      message.author.id === client.user.id &&
+      message.components.some(row =>
+        row.components.some(
+          component => component.customId === customId
+        )
+      )
+    )
+  );
+}
+
+function hookPanelComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_hook_author')
+        .setLabel('Author')
+        .setEmoji('👤')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_body')
+        .setLabel('Body')
+        .setEmoji('📝')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_addfield')
+        .setLabel('Tambah Field')
+        .setEmoji('🧩')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_images')
+        .setLabel('Images')
+        .setEmoji('🖼️')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_footer')
+        .setLabel('Footer')
+        .setEmoji('📎')
+        .setStyle(ButtonStyle.Secondary)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_hook_delfield')
+        .setLabel('Hapus Field')
+        .setEmoji('➖')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_preview')
+        .setLabel('Preview')
+        .setEmoji('👁️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_send')
+        .setLabel('Kirim')
+        .setEmoji('🚀')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('ry_hook_reset')
+        .setLabel('Reset')
+        .setEmoji('🗑️')
+        .setStyle(ButtonStyle.Danger)
+    )
+  ];
+}
+
+function rrPanelComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_rr_panel_new')
+        .setLabel('Buat Panel')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('ry_rr_panel_add')
+        .setLabel('Tambah Role')
+        .setEmoji('🎭')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('ry_rr_panel_delrole')
+        .setLabel('Hapus Role')
+        .setEmoji('➖')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('ry_rr_panel_list')
+        .setLabel('Daftar')
+        .setEmoji('📋')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_rr_panel_delpanel')
+        .setLabel('Hapus Panel')
+        .setEmoji('🗑️')
+        .setStyle(ButtonStyle.Danger)
+    )
+  ];
+}
+
+async function setupHook(guild) {
+  const cfg = guildConfig(guild.id);
+
+  const staffRole = await getStaffRole(guild);
+
+  const category = await findOrCreateCategory(
+    guild,
+    '・ー ✧ Tools ✧ ー・'
+  );
+
+  const panel = await findOrCreateChannel(
+    guild,
+    '🪝・hook-setting',
+    ChannelType.GuildText,
+    {
+      parent: category.id,
+      topic: 'Panel khusus Staff untuk membuat dan mengirim pesan embed.',
+      permissionOverwrites: staffOnlyOverwrites(guild, staffRole)
+    }
+  );
+
+  cfg.toolsCategoryId = category.id;
+  cfg.hookPanelChannelId = panel.id;
+
+  saveConfig();
+
+  if (!(await panelAlreadyPosted(panel, 'ry_hook_author'))) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🪝 Hook — Pembuat Embed')
+      .setDescription(
+        'Bikin pesan embed ala Discohook langsung dari Discord.\n\n' +
+        '**1.** Isi bagian yang kamu mau: **Author**, **Body**, **Field**, **Images**, **Footer**.\n' +
+        '**2.** Preview muncul otomatis tiap selesai edit (atau klik **Preview**).\n' +
+        '**3.** Klik **Kirim**, lalu pilih channel tujuan.\n\n' +
+        'Draft disimpan per orang, jadi tiap Staff punya draft sendiri.'
+      )
+      .setFooter({ text: 'RY Hook' });
+
+    await panel.send({
+      embeds: [embed],
+      components: hookPanelComponents()
+    });
+  }
+
+  return { staffRole, category, panel };
+}
+
+async function setupReactionRole(guild) {
+  const cfg = guildConfig(guild.id);
+
+  const staffRole = await getStaffRole(guild);
+
+  const category = await findOrCreateCategory(
+    guild,
+    '・ー ✧ Tools ✧ ー・'
+  );
+
+  const panel = await findOrCreateChannel(
+    guild,
+    '🎭・reactionrole-setting',
+    ChannelType.GuildText,
+    {
+      parent: category.id,
+      topic: 'Panel khusus Staff untuk mengatur reaction role.',
+      permissionOverwrites: staffOnlyOverwrites(guild, staffRole)
+    }
+  );
+
+  cfg.toolsCategoryId = category.id;
+  cfg.reactionRolePanelChannelId = panel.id;
+
+  saveConfig();
+
+  if (!(await panelAlreadyPosted(panel, 'ry_rr_panel_new'))) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🎭 Reaction Role — Panel Kontrol')
+      .setDescription(
+        'Atur role yang bisa diambil member sendiri.\n\n' +
+        '➕ **Buat Panel** — pilih channel dan tipe (Tombol / Dropdown / Reaksi emoji)\n' +
+        '🎭 **Tambah Role** — masukkan role ke panel\n' +
+        '➖ **Hapus Role** — keluarkan role dari panel\n' +
+        '📋 **Daftar** — lihat semua panel\n' +
+        '🗑️ **Hapus Panel** — hapus panel'
+      )
+      .setFooter({ text: 'RY Reaction Role' });
+
+    await panel.send({
+      embeds: [embed],
+      components: rrPanelComponents()
+    });
+  }
+
+  return { staffRole, category, panel };
+}
+
 async function setupAll(guild) {
   const welcome = await setupWelcome(guild);
   const ticket = await setupTicket(guild);
   const vouches = await setupVouches(guild);
   const giveaway = await setupGiveaway(guild);
+  const hook = await setupHook(guild);
+  const reactionRole = await setupReactionRole(guild);
 
-  return { welcome, ticket, vouches, giveaway };
+  return { welcome, ticket, vouches, giveaway, hook, reactionRole };
 }
 
 // ===============================
@@ -1277,7 +1529,7 @@ async function handleGiveawayModal(interaction) {
 
   if (!rundown?.isTextBased()) {
     return interaction.reply({
-      content: 'Channel rundown tidak ditemukan. Jalankan `ry!setup giveaway` dulu.',
+      content: 'Channel rundown tidak ditemukan. Jalankan `/setup giveaway` dulu.',
       ephemeral: true
     });
   }
@@ -1665,7 +1917,7 @@ async function createTicket(interaction, categoryKey) {
 
   if (!category || !staffRole) {
     return interaction.reply({
-      content: 'Jalankan ry!setup ticket terlebih dahulu.',
+      content: 'Jalankan /setup ticket terlebih dahulu.',
       ephemeral: true
     });
   }
@@ -1794,56 +2046,1967 @@ async function createTicket(interaction, categoryKey) {
 }
 
 // ===============================
-// PARSER VOUCHES
+// SLASH COMMANDS
 // ===============================
 
-function parseVouchArgs(content, attachmentUrl) {
-  const raw = content
-    .slice(`${PREFIX}vouches`.length)
-    .trim();
+function buildSlashCommands() {
+  const setup = new SlashCommandBuilder()
+    .setName('setup')
+    .setDescription('Setup sistem bot (khusus admin / Staff)');
 
-  const urlMatch = raw.match(/https?:\/\/\S+/i);
-  const mentionMatch = raw.match(/<@!?(\d+)>/);
-  const statusMatch = raw.match(/(?:^|\s)(done|pending)\s*$/i);
+  const targets = [
+    ['all', 'Setup semua sistem sekaligus'],
+    ['welcome', 'Voice welcome + role Verified'],
+    ['ticket', 'Panel ticket support'],
+    ['vouches', 'Channel vouches'],
+    ['giveaway', 'Kategori giveaway (rundown, history, setting)'],
+    ['hook', 'Panel pembuat embed ala Discohook'],
+    ['reactionrole', 'Panel reaction role']
+  ];
 
-  const imageUrl = urlMatch?.[0] || attachmentUrl;
-
-  if (!imageUrl || !mentionMatch || !statusMatch) {
-    return null;
+  for (const [name, description] of targets) {
+    setup.addSubcommand(sub =>
+      sub.setName(name).setDescription(description)
+    );
   }
 
-  let rest = raw;
+  return [
+    new SlashCommandBuilder()
+      .setName('help')
+      .setDescription('Daftar command RY Bot'),
 
-  if (urlMatch) {
-    rest = rest.replace(urlMatch[0], ' ');
+    setup,
+
+    new SlashCommandBuilder()
+      .setName('welcome')
+      .setDescription('Pengaturan welcome')
+      .addSubcommand(sub =>
+        sub
+          .setName('test')
+          .setDescription('Tes audio welcome.mp3 di voice channel kamu')
+      ),
+
+    new SlashCommandBuilder()
+      .setName('ticket')
+      .setDescription('Pengaturan ticket')
+      .addSubcommand(sub =>
+        sub
+          .setName('close')
+          .setDescription('Tutup ticket di channel ini')
+      ),
+
+    new SlashCommandBuilder()
+      .setName('vouches')
+      .setDescription('Catat vouches transaksi (khusus admin / Staff)')
+      .addUserOption(option =>
+        option
+          .setName('buyer')
+          .setDescription('Pembeli')
+          .setRequired(true)
+      )
+      .addStringOption(option =>
+        option
+          .setName('produk')
+          .setDescription('Nama produk')
+          .setRequired(true)
+          .setMaxLength(200)
+      )
+      .addIntegerOption(option =>
+        option
+          .setName('harga')
+          .setDescription('Total harga (angka saja)')
+          .setRequired(true)
+          .setMinValue(0)
+          .setMaxValue(1000000000000)
+      )
+      .addStringOption(option =>
+        option
+          .setName('status')
+          .setDescription('Status transaksi')
+          .setRequired(true)
+          .addChoices(
+            { name: 'Done', value: 'done' },
+            { name: 'Pending', value: 'pending' }
+          )
+      )
+      .addAttachmentOption(option =>
+        option
+          .setName('gambar')
+          .setDescription('Bukti transaksi (upload gambar)')
+      )
+      .addStringOption(option =>
+        option
+          .setName('link')
+          .setDescription('Atau link gambar bukti transaksi')
+      )
+  ].map(command => command.toJSON());
+}
+
+async function registerSlashCommands(guild) {
+  try {
+    await guild.commands.set(buildSlashCommands());
+  } catch (error) {
+    console.error(
+      `Gagal mendaftarkan slash command di server "${guild.name}": ${error.message}\n` +
+      'Pastikan bot diundang dengan scope "applications.commands" (OAuth2 → URL Generator → centang bot + applications.commands).'
+    );
+  }
+}
+
+async function handleSlashCommand(interaction) {
+  if (!interaction.guild) {
+    return interaction.reply({
+      content: 'Command ini hanya bisa dipakai di dalam server.',
+      ephemeral: true
+    });
   }
 
-  rest = rest.replace(mentionMatch[0], ' ');
-  rest = rest.replace(/(?:^|\s)(done|pending)\s*$/i, ' ').trim();
+  const name = interaction.commandName;
 
-  const priceMatch = rest.match(/(?:^|\s)([\d][\d.,]*)\s*$/);
+  // HELP
+  if (name === 'help') {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('RY Bot Commands')
+      .setDescription([
+        '`/setup all` — setup semua sistem',
+        '`/setup welcome` — voice welcome + role Verified',
+        '`/setup ticket` — panel ticket',
+        '`/setup vouches` — channel vouches',
+        '`/setup giveaway` — rundown, history, dan panel giveaway',
+        '`/setup hook` — panel pembuat embed (ala Discohook)',
+        '`/setup reactionrole` — panel reaction role',
+        '`/welcome test` — tes audio welcome.mp3',
+        '`/vouches` — catat vouches transaksi',
+        '`/ticket close` — tutup ticket'
+      ].join('\n'));
 
-  if (!priceMatch) return null;
-
-  const price = Number(priceMatch[1].replace(/\D/g, ''));
-
-  const product = rest.slice(0, priceMatch.index).trim();
-
-  if (
-    !product ||
-    !Number.isSafeInteger(price) ||
-    price < 0
-  ) {
-    return null;
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
+
+  // SETUP
+  if (name === 'setup') {
+    if (!isStaff(interaction.member)) {
+      return interaction.reply({
+        content: 'Command setup hanya untuk admin atau Staff.',
+        ephemeral: true
+      });
+    }
+
+    const target = interaction.options.getSubcommand();
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      const guild = interaction.guild;
+
+      if (target === 'welcome') {
+        const result = await setupWelcome(guild);
+
+        return interaction.editReply(
+          `Welcome siap! Voice channel: ${result.voice}. Role: ${result.verifiedRole.name}.`
+        );
+      }
+
+      if (target === 'ticket') {
+        const result = await setupTicket(guild);
+
+        return interaction.editReply(
+          `Ticket siap! Panel: ${result.panel}. Log: ${result.logs}. Tambahkan staff ke role ${result.staffRole.name}.`
+        );
+      }
+
+      if (target === 'vouches') {
+        const channel = await setupVouches(guild);
+
+        return interaction.editReply(
+          `Channel vouches siap: ${channel}`
+        );
+      }
+
+      if (target === 'giveaway') {
+        const result = await setupGiveaway(guild);
+
+        return interaction.editReply(
+          `Giveaway siap! Rundown: ${result.rundown}. History: ${result.history}. Panel kontrol (khusus Staff): ${result.setting}.`
+        );
+      }
+
+      if (target === 'hook') {
+        const result = await setupHook(guild);
+
+        return interaction.editReply(
+          `Hook siap! Buka panel (khusus Staff): ${result.panel}`
+        );
+      }
+
+      if (target === 'reactionrole') {
+        const result = await setupReactionRole(guild);
+
+        return interaction.editReply(
+          `Reaction role siap! Buka panel (khusus Staff): ${result.panel}`
+        );
+      }
+
+      if (target === 'all') {
+        const result = await setupAll(guild);
+
+        return interaction.editReply(
+          `Setup RY selesai!\n` +
+          `Welcome: ${result.welcome.voice}\n` +
+          `Ticket: ${result.ticket.panel}\n` +
+          `Logs: ${result.ticket.logs}\n` +
+          `Vouches: ${result.vouches}\n` +
+          `Giveaway: ${result.giveaway.setting}\n` +
+          `Hook: ${result.hook.panel}\n` +
+          `Reaction Role: ${result.reactionRole.panel}\n\n` +
+          `Atur permission channel member agar role Verified mendapat akses.`
+        );
+      }
+    } catch (error) {
+      console.error(error);
+
+      return interaction.editReply(
+        'Setup gagal. Periksa izin bot dan console VPS.'
+      );
+    }
+
+    return;
+  }
+
+  // TES AUDIO WELCOME (MP3)
+  if (name === 'welcome') {
+    if (!isStaff(interaction.member)) {
+      return interaction.reply({
+        content: 'Khusus admin atau Staff.',
+        ephemeral: true
+      });
+    }
+
+    const voiceChannel = interaction.member.voice?.channel;
+
+    if (!voiceChannel) {
+      return interaction.reply({
+        content: 'Masuk voice channel dulu, lalu jalankan /welcome test.',
+        ephemeral: true
+      });
+    }
+
+    await interaction.reply({
+      content: 'Memutar welcome.mp3...',
+      ephemeral: true
+    });
+
+    try {
+      await playWelcomeAudio(voiceChannel);
+
+      await interaction.editReply('Tes audio selesai.');
+    } catch (error) {
+      console.error(error);
+
+      await interaction.editReply(
+        `Audio gagal: ${error.message}\n` +
+        'Cek juga FFmpeg, izin Connect serta Speak, dan lokasi welcome.mp3.'
+      );
+    }
+
+    return;
+  }
+
+  // TUTUP TICKET
+  if (name === 'ticket') {
+    const ownerMatch = interaction.channel?.topic?.match(
+      /ticket-owner:(\d+)/
+    );
+
+    if (!ownerMatch) {
+      return interaction.reply({
+        content: 'Command ini hanya bisa dipakai di channel ticket.',
+        ephemeral: true
+      });
+    }
+
+    const isOwner = ownerMatch[1] === interaction.user.id;
+
+    if (!isOwner && !isStaff(interaction.member)) {
+      return interaction.reply({
+        content: 'Hanya pembuat ticket atau staff yang bisa menutupnya.',
+        ephemeral: true
+      });
+    }
+
+    await interaction.reply(
+      'Ticket ditutup. Transcript sedang dibuat...'
+    );
+
+    await closeTicket(interaction.channel, interaction.user);
+
+    return;
+  }
+
+  // VOUCHES
+  if (name === 'vouches') {
+    if (!isStaff(interaction.member)) {
+      return interaction.reply({
+        content: 'Command vouches hanya untuk admin atau Staff.',
+        ephemeral: true
+      });
+    }
+
+    const cfg = guildConfig(interaction.guild.id);
+
+    const targetChannel = cfg.vouchesChannelId
+      ? interaction.guild.channels.cache.get(cfg.vouchesChannelId)
+      : null;
+
+    if (!targetChannel?.isTextBased()) {
+      return interaction.reply({
+        content: 'Jalankan /setup vouches terlebih dahulu.',
+        ephemeral: true
+      });
+    }
+
+    const attachment = interaction.options.getAttachment('gambar');
+    const linkOption = interaction.options.getString('link');
+
+    if (attachment && !attachment.contentType?.startsWith('image/')) {
+      return interaction.reply({
+        content: 'File yang diupload harus berupa gambar.',
+        ephemeral: true
+      });
+    }
+
+    const imageUrl = attachment?.url || linkOption;
+
+    if (!imageUrl || !isValidHttpUrl(imageUrl)) {
+      return interaction.reply({
+        content: 'Sertakan bukti transaksi: upload gambar di opsi **gambar**, atau isi opsi **link** dengan URL gambar (diawali https://).',
+        ephemeral: true
+      });
+    }
+
+    const buyerUser = interaction.options.getUser('buyer', true);
+
+    const buyer = await interaction.guild.members.fetch(
+      buyerUser.id
+    ).catch(() => null);
+
+    if (!buyer) {
+      return interaction.reply({
+        content: 'Buyer tidak ditemukan di server.',
+        ephemeral: true
+      });
+    }
+
+    const product = interaction.options.getString('produk', true).trim();
+    const price = interaction.options.getInteger('harga', true);
+    const done = interaction.options.getString('status', true) === 'done';
+
+    const embed = new EmbedBuilder()
+      .setColor(done ? 0x57f287 : 0xfee75c)
+      .setTitle('🧾 Vouches Transaksi')
+      .addFields(
+        {
+          name: 'Buyer',
+          value: `${buyer}`,
+          inline: true
+        },
+        {
+          name: 'Produk',
+          value: product.slice(0, 1024),
+          inline: true
+        },
+        {
+          name: 'Total Harga',
+          value: moneyIDR(price),
+          inline: true
+        },
+        {
+          name: 'Status',
+          value: done ? '✅ DONE' : '🕒 PENDING',
+          inline: true
+        },
+        {
+          name: 'Dicatat oleh',
+          value: `${interaction.user}`,
+          inline: true
+        }
+      )
+      .setImage(imageUrl)
+      .setFooter({ text: 'RY Vouches' })
+      .setTimestamp();
+
+    await targetChannel.send({
+      embeds: [embed],
+      allowedMentions: { users: [] }
+    });
+
+    return interaction.reply({
+      content: `Vouches berhasil dikirim ke ${targetChannel}.`,
+      ephemeral: true
+    });
+  }
+}
+
+// ===============================
+// HELPER UMUM (URL, INPUT MODAL)
+// ===============================
+
+function isValidHttpUrl(value) {
+  try {
+    const url = new URL(value);
+
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+function parseHexColor(text) {
+  const match = /^#?([0-9a-f]{6})$/i.exec(String(text).trim());
+
+  return match ? parseInt(match[1], 16) : null;
+}
+
+function parseYes(text) {
+  return /^(ya|iya|y|yes|true|1)$/i.test(String(text).trim());
+}
+
+// Bikin baris input untuk modal
+function textInput({
+  id,
+  label,
+  style = TextInputStyle.Short,
+  value,
+  placeholder,
+  max,
+  required = false
+}) {
+  const input = new TextInputBuilder()
+    .setCustomId(id)
+    .setLabel(label)
+    .setStyle(style)
+    .setRequired(required);
+
+  if (placeholder) input.setPlaceholder(placeholder);
+  if (max) input.setMaxLength(max);
+  if (value) input.setValue(String(value).slice(0, max || 4000));
+
+  return new ActionRowBuilder().addComponents(input);
+}
+
+function buildModal(customId, title, rows) {
+  return new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(title)
+    .addComponents(...rows);
+}
+
+// ===============================
+// HOOK (PEMBUAT EMBED ALA DISCOHOOK)
+// ===============================
+
+const hookDrafts = new Map();
+const HOOK_DRAFT_TTL = 2 * 60 * 60 * 1000;
+
+function newHookDraft() {
+  return {
+    content: '',
+    author: {},
+    title: '',
+    url: '',
+    description: '',
+    color: null,
+    fields: [],
+    thumbnail: '',
+    image: '',
+    footer: {},
+    timestamp: false,
+    updatedAt: Date.now()
+  };
+}
+
+function hookDraftKey(interaction) {
+  return `${interaction.guild.id}:${interaction.user.id}`;
+}
+
+function getHookDraft(interaction) {
+  const now = Date.now();
+
+  // Buang draft yang udah lama nggak disentuh
+  for (const [key, draft] of hookDrafts) {
+    if (now - draft.updatedAt > HOOK_DRAFT_TTL) {
+      hookDrafts.delete(key);
+    }
+  }
+
+  const key = hookDraftKey(interaction);
+
+  let draft = hookDrafts.get(key);
+
+  if (!draft) {
+    draft = newHookDraft();
+    hookDrafts.set(key, draft);
+  }
+
+  draft.updatedAt = now;
+
+  return draft;
+}
+
+function hookHasEmbed(draft) {
+  return Boolean(
+    draft.author.name ||
+    draft.title ||
+    draft.description ||
+    draft.fields.length ||
+    draft.thumbnail ||
+    draft.image ||
+    draft.footer.text
+  );
+}
+
+// Batas Discord: total teks satu embed maksimal 6000 karakter
+function hookEmbedLength(draft) {
+  return (
+    (draft.author.name || '').length +
+    draft.title.length +
+    draft.description.length +
+    (draft.footer.text || '').length +
+    draft.fields.reduce(
+      (total, field) => total + field.name.length + field.value.length,
+      0
+    )
+  );
+}
+
+function buildHookEmbed(draft) {
+  const embed = new EmbedBuilder().setColor(
+    draft.color ?? 0x5865f2
+  );
+
+  if (draft.author.name) {
+    embed.setAuthor({
+      name: draft.author.name,
+      ...(draft.author.iconURL ? { iconURL: draft.author.iconURL } : {}),
+      ...(draft.author.url ? { url: draft.author.url } : {})
+    });
+  }
+
+  if (draft.title) embed.setTitle(draft.title);
+  if (draft.title && draft.url) embed.setURL(draft.url);
+  if (draft.description) embed.setDescription(draft.description);
+  if (draft.fields.length) embed.addFields(draft.fields);
+  if (draft.thumbnail) embed.setThumbnail(draft.thumbnail);
+  if (draft.image) embed.setImage(draft.image);
+
+  if (draft.footer.text) {
+    embed.setFooter({
+      text: draft.footer.text,
+      ...(draft.footer.iconURL ? { iconURL: draft.footer.iconURL } : {})
+    });
+  }
+
+  if (draft.timestamp) embed.setTimestamp();
+
+  return embed;
+}
+
+function buildHookPayload(draft) {
+  const payload = {};
+
+  if (draft.content) payload.content = draft.content;
+  if (hookHasEmbed(draft)) payload.embeds = [buildHookEmbed(draft)];
+
+  return payload;
+}
+
+function hookProblem(draft) {
+  const payload = buildHookPayload(draft);
+
+  if (!payload.content && !payload.embeds) {
+    return 'Draft masih kosong. Isi Body, Author, Field, Images, atau Footer dulu.';
+  }
+
+  if (hookEmbedLength(draft) > 6000) {
+    return 'Total teks embed melebihi 6000 karakter (batas Discord). Kurangi isi embed.';
+  }
+
+  return null;
+}
+
+function hookPreviewReply(draft, notice) {
+  const payload = buildHookPayload(draft);
+  const problem = hookProblem(draft);
+  const lines = [notice];
+
+  if (problem && hookHasEmbed(draft)) lines.push(`⚠️ ${problem}`);
+  if (draft.content) lines.push('', draft.content);
 
   return {
-    imageUrl,
-    buyerId: mentionMatch[1],
-    product,
-    price,
-    status: statusMatch[1].toLowerCase()
+    content: lines.join('\n').slice(0, 2000),
+    embeds: payload.embeds || [],
+    allowedMentions: { parse: [] }
   };
+}
+
+function hookFail(interaction, message) {
+  return interaction.reply({
+    content: `❌ ${message}`,
+    ephemeral: true
+  });
+}
+
+async function handleHookButton(interaction) {
+  const draft = getHookDraft(interaction);
+
+  switch (interaction.customId) {
+    case 'ry_hook_author':
+      return interaction.showModal(
+        buildModal('ry_hook_modal_author', 'Author', [
+          textInput({
+            id: 'name',
+            label: 'Nama Author',
+            value: draft.author.name,
+            max: 256
+          }),
+          textInput({
+            id: 'icon',
+            label: 'URL Icon Author',
+            value: draft.author.iconURL,
+            placeholder: 'https://...',
+            max: 500
+          }),
+          textInput({
+            id: 'url',
+            label: 'Link Author (opsional)',
+            value: draft.author.url,
+            placeholder: 'https://...',
+            max: 500
+          })
+        ])
+      );
+
+    case 'ry_hook_body':
+      return interaction.showModal(
+        buildModal('ry_hook_modal_body', 'Body', [
+          textInput({
+            id: 'title',
+            label: 'Judul',
+            value: draft.title,
+            max: 256
+          }),
+          textInput({
+            id: 'titleurl',
+            label: 'Link Judul (opsional)',
+            value: draft.url,
+            placeholder: 'https://...',
+            max: 500
+          }),
+          textInput({
+            id: 'description',
+            label: 'Isi Pesan (Body)',
+            style: TextInputStyle.Paragraph,
+            value: draft.description,
+            max: 4000
+          }),
+          textInput({
+            id: 'color',
+            label: 'Warna (hex, contoh #5865F2)',
+            value: draft.color === null
+              ? ''
+              : `#${draft.color.toString(16).padStart(6, '0')}`,
+            max: 7
+          }),
+          textInput({
+            id: 'content',
+            label: 'Teks di luar embed (opsional)',
+            style: TextInputStyle.Paragraph,
+            value: draft.content,
+            max: 1800
+          })
+        ])
+      );
+
+    case 'ry_hook_addfield':
+      if (draft.fields.length >= 25) {
+        return hookFail(
+          interaction,
+          'Maksimal 25 field per embed. Hapus salah satu dulu.'
+        );
+      }
+
+      return interaction.showModal(
+        buildModal('ry_hook_modal_field', 'Tambah Field', [
+          textInput({
+            id: 'name',
+            label: 'Nama Field',
+            max: 256,
+            required: true
+          }),
+          textInput({
+            id: 'value',
+            label: 'Isi Field',
+            style: TextInputStyle.Paragraph,
+            max: 1024,
+            required: true
+          }),
+          textInput({
+            id: 'inline',
+            label: 'Sejajar (inline)? ya / tidak',
+            value: 'tidak',
+            max: 5
+          })
+        ])
+      );
+
+    case 'ry_hook_images':
+      return interaction.showModal(
+        buildModal('ry_hook_modal_images', 'Images', [
+          textInput({
+            id: 'thumbnail',
+            label: 'URL Thumbnail (gambar kecil)',
+            value: draft.thumbnail,
+            placeholder: 'https://...',
+            max: 500
+          }),
+          textInput({
+            id: 'image',
+            label: 'URL Image (gambar besar)',
+            value: draft.image,
+            placeholder: 'https://...',
+            max: 500
+          })
+        ])
+      );
+
+    case 'ry_hook_footer':
+      return interaction.showModal(
+        buildModal('ry_hook_modal_footer', 'Footer', [
+          textInput({
+            id: 'text',
+            label: 'Teks Footer',
+            value: draft.footer.text,
+            max: 2048
+          }),
+          textInput({
+            id: 'icon',
+            label: 'URL Icon Footer (opsional)',
+            value: draft.footer.iconURL,
+            placeholder: 'https://...',
+            max: 500
+          }),
+          textInput({
+            id: 'timestamp',
+            label: 'Tampilkan waktu? ya / tidak',
+            value: draft.timestamp ? 'ya' : 'tidak',
+            max: 5
+          })
+        ])
+      );
+
+    case 'ry_hook_delfield': {
+      if (!draft.fields.length) {
+        return hookFail(interaction, 'Belum ada field di draft kamu.');
+      }
+
+      const menu = new StringSelectMenuBuilder()
+        .setCustomId('ry_hook_delfield_select')
+        .setPlaceholder('Pilih field yang mau dihapus...')
+        .addOptions(
+          draft.fields.map((field, index) => ({
+            label: `${index + 1}. ${field.name}`.slice(0, 100),
+            value: String(index)
+          }))
+        );
+
+      return interaction.reply({
+        content: 'Pilih field yang mau dihapus:',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_preview':
+      return interaction.reply({
+        ...hookPreviewReply(draft, '👁️ Draft kamu saat ini:'),
+        ephemeral: true
+      });
+
+    case 'ry_hook_send': {
+      const problem = hookProblem(draft);
+
+      if (problem) return hookFail(interaction, problem);
+
+      const menu = new ChannelSelectMenuBuilder()
+        .setCustomId('ry_hook_send_channel')
+        .setPlaceholder('Pilih channel tujuan...')
+        .setChannelTypes(
+          ChannelType.GuildText,
+          ChannelType.GuildAnnouncement
+        );
+
+      return interaction.reply({
+        content: 'Kirim pesan ke channel mana?',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_reset':
+      hookDrafts.delete(hookDraftKey(interaction));
+
+      return interaction.reply({
+        content: '🗑️ Draft direset. Kamu bisa mulai dari awal.',
+        ephemeral: true
+      });
+  }
+}
+
+async function handleHookModal(interaction) {
+  const draft = getHookDraft(interaction);
+  const get = id => interaction.fields.getTextInputValue(id).trim();
+
+  switch (interaction.customId) {
+    case 'ry_hook_modal_author': {
+      const name = get('name');
+      const iconURL = get('icon');
+      const url = get('url');
+
+      if (iconURL && !isValidHttpUrl(iconURL)) {
+        return hookFail(interaction, 'URL icon author tidak valid (harus diawali https://).');
+      }
+
+      if (url && !isValidHttpUrl(url)) {
+        return hookFail(interaction, 'Link author tidak valid (harus diawali https://).');
+      }
+
+      draft.author = name ? { name, iconURL, url } : {};
+
+      return interaction.reply({
+        ...hookPreviewReply(
+          draft,
+          name ? '✅ Author disimpan.' : '✅ Author dikosongkan.'
+        ),
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_modal_body': {
+      const url = get('titleurl');
+      const colorText = get('color');
+
+      if (url && !isValidHttpUrl(url)) {
+        return hookFail(interaction, 'Link judul tidak valid (harus diawali https://).');
+      }
+
+      let color = null;
+
+      if (colorText) {
+        color = parseHexColor(colorText);
+
+        if (color === null) {
+          return hookFail(interaction, 'Warna harus format hex 6 digit, contoh `#5865F2`.');
+        }
+      }
+
+      draft.title = get('title');
+      draft.url = url;
+      draft.description = get('description');
+      draft.color = color;
+      draft.content = get('content');
+
+      return interaction.reply({
+        ...hookPreviewReply(draft, '✅ Body disimpan.'),
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_modal_field': {
+      if (draft.fields.length >= 25) {
+        return hookFail(interaction, 'Maksimal 25 field per embed.');
+      }
+
+      draft.fields.push({
+        name: get('name').slice(0, 256),
+        value: get('value').slice(0, 1024),
+        inline: parseYes(get('inline'))
+      });
+
+      return interaction.reply({
+        ...hookPreviewReply(
+          draft,
+          `✅ Field ditambahkan (total ${draft.fields.length}).`
+        ),
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_modal_images': {
+      const thumbnail = get('thumbnail');
+      const image = get('image');
+
+      if (thumbnail && !isValidHttpUrl(thumbnail)) {
+        return hookFail(interaction, 'URL thumbnail tidak valid (harus diawali https://).');
+      }
+
+      if (image && !isValidHttpUrl(image)) {
+        return hookFail(interaction, 'URL image tidak valid (harus diawali https://).');
+      }
+
+      draft.thumbnail = thumbnail;
+      draft.image = image;
+
+      return interaction.reply({
+        ...hookPreviewReply(draft, '✅ Images disimpan.'),
+        ephemeral: true
+      });
+    }
+
+    case 'ry_hook_modal_footer': {
+      const text = get('text');
+      const iconURL = get('icon');
+
+      if (iconURL && !isValidHttpUrl(iconURL)) {
+        return hookFail(interaction, 'URL icon footer tidak valid (harus diawali https://).');
+      }
+
+      draft.footer = text ? { text, iconURL } : {};
+      draft.timestamp = parseYes(get('timestamp'));
+
+      return interaction.reply({
+        ...hookPreviewReply(draft, '✅ Footer disimpan.'),
+        ephemeral: true
+      });
+    }
+  }
+}
+
+async function routeHook(interaction) {
+  const id = interaction.customId;
+
+  if (typeof id !== 'string' || !id.startsWith('ry_hook_')) {
+    return false;
+  }
+
+  if (!isStaff(interaction.member)) {
+    await interaction.reply({
+      content: 'Fitur ini hanya untuk admin atau Staff.',
+      ephemeral: true
+    });
+
+    return true;
+  }
+
+  if (interaction.isButton()) {
+    await handleHookButton(interaction);
+    return true;
+  }
+
+  if (interaction.isModalSubmit()) {
+    await handleHookModal(interaction);
+    return true;
+  }
+
+  // Menu hapus field
+  if (
+    interaction.isStringSelectMenu() &&
+    id === 'ry_hook_delfield_select'
+  ) {
+    const draft = getHookDraft(interaction);
+    const index = Number(interaction.values[0]);
+
+    if (Number.isInteger(index) && draft.fields[index]) {
+      draft.fields.splice(index, 1);
+    }
+
+    await interaction.update({
+      ...hookPreviewReply(draft, '✅ Field dihapus.'),
+      components: []
+    });
+
+    return true;
+  }
+
+  // Menu pilih channel tujuan kirim
+  if (
+    interaction.isChannelSelectMenu() &&
+    id === 'ry_hook_send_channel'
+  ) {
+    const draft = getHookDraft(interaction);
+    const problem = hookProblem(draft);
+
+    if (problem) {
+      await interaction.update({
+        content: `❌ ${problem}`,
+        components: []
+      });
+
+      return true;
+    }
+
+    const channel = interaction.guild.channels.cache.get(
+      interaction.values[0]
+    );
+
+    const permissions = channel?.permissionsFor(
+      interaction.guild.members.me
+    );
+
+    if (
+      !channel?.isTextBased() ||
+      !permissions?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks
+      ])
+    ) {
+      await interaction.update({
+        content: '❌ Bot tidak punya izin View Channel, Send Messages, dan Embed Links di channel itu.',
+        components: []
+      });
+
+      return true;
+    }
+
+    await interaction.deferUpdate();
+
+    try {
+      const sent = await channel.send(buildHookPayload(draft));
+
+      await interaction.editReply({
+        content: `✅ Pesan terkirim ke ${channel}: ${sent.url}`,
+        components: []
+      });
+    } catch (error) {
+      console.error('Hook gagal kirim:', error);
+
+      await interaction.editReply({
+        content: `❌ Gagal mengirim pesan: ${error.message}`,
+        components: []
+      });
+    }
+
+    return true;
+  }
+
+  return true;
+}
+
+// ===============================
+// REACTION ROLE
+// ===============================
+
+const RR_PATH = path.join(ROOT, 'reactionroles.json');
+
+let reactionRoles = {};
+
+if (fs.existsSync(RR_PATH)) {
+  try {
+    reactionRoles = JSON.parse(fs.readFileSync(RR_PATH, 'utf8'));
+  } catch (error) {
+    console.error('Gagal membaca reactionroles.json:', error);
+  }
+}
+
+function saveReactionRoles() {
+  fs.writeFileSync(
+    RR_PATH,
+    JSON.stringify(reactionRoles, null, 2)
+  );
+}
+
+const RR_MODE_LABEL = {
+  button: 'Tombol',
+  dropdown: 'Dropdown',
+  reaction: 'Reaksi Emoji'
+};
+
+const RR_LIMITS = {
+  button: 25,
+  dropdown: 25,
+  reaction: 20
+};
+
+// Role dengan izin ini nggak boleh jadi role yang bisa diambil sendiri
+const RR_BLOCKED_PERMISSIONS = [
+  PermissionFlagsBits.Administrator,
+  PermissionFlagsBits.ManageGuild,
+  PermissionFlagsBits.ManageRoles,
+  PermissionFlagsBits.ManageChannels,
+  PermissionFlagsBits.BanMembers,
+  PermissionFlagsBits.KickMembers,
+  PermissionFlagsBits.ModerateMembers
+];
+
+const UNICODE_EMOJI_REGEX =
+  /\p{Extended_Pictographic}|\p{Regional_Indicator}|[0-9#*]\uFE0F?\u20E3/u;
+
+function parseEmoji(text) {
+  const raw = String(text || '').trim();
+
+  if (!raw) return null;
+
+  const custom = raw.match(/^<(a?):(\w{2,32}):(\d{17,20})>$/);
+
+  if (custom) {
+    return {
+      animated: custom[1] === 'a',
+      name: custom[2],
+      id: custom[3]
+    };
+  }
+
+  return { animated: false, name: raw, id: null };
+}
+
+const emojiKey = emoji => emoji.id || emoji.name;
+
+const emojiReactRef = emoji =>
+  emoji.id ? `${emoji.name}:${emoji.id}` : emoji.name;
+
+const emojiDisplay = emoji =>
+  emoji.id
+    ? `<${emoji.animated ? 'a' : ''}:${emoji.name}:${emoji.id}>`
+    : emoji.name;
+
+const emojiForComponent = emoji =>
+  emoji.id
+    ? { id: emoji.id, name: emoji.name, animated: emoji.animated }
+    : emoji.name;
+
+function guildRRPanels(guildId) {
+  return Object.values(reactionRoles)
+    .filter(panel => panel.guildId === guildId)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function rrPanelLink(panel) {
+  return `https://discord.com/channels/${panel.guildId}/${panel.channelId}/${panel.messageId}`;
+}
+
+// Balikin teks error kalau role nggak aman / nggak bisa dibagikan bot
+function checkRoleAssignable(guild, role) {
+  const me = guild.members.me;
+
+  if (!me) return 'Bot belum siap, coba lagi sebentar.';
+
+  if (role.id === guild.id) {
+    return 'Role @everyone tidak bisa dipakai.';
+  }
+
+  if (role.managed) {
+    return 'Role itu dikelola bot/integrasi lain, jadi tidak bisa dibagikan.';
+  }
+
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    return 'Bot butuh izin **Manage Roles**.';
+  }
+
+  if (role.position >= me.roles.highest.position) {
+    return 'Role itu posisinya sejajar atau di atas role bot. Naikkan role bot di atas role tersebut (Server Settings → Roles).';
+  }
+
+  if (RR_BLOCKED_PERMISSIONS.some(permission => role.permissions.has(permission))) {
+    return 'Role itu punya izin berbahaya (Administrator, Manage Server/Roles/Channels, Ban, Kick, atau Timeout), jadi tidak boleh dijadikan role yang bisa diambil sendiri.';
+  }
+
+  return null;
+}
+
+function buildRRPayload(panel, guild) {
+  const lines = panel.items.map(item => {
+    const emoji = item.emoji ? `${emojiDisplay(item.emoji)} ` : '';
+    const label = item.label ? ` — ${item.label}` : '';
+
+    return `${emoji}<@&${item.roleId}>${label}`;
+  });
+
+  const footers = {
+    button: 'Klik tombol untuk ambil atau lepas role',
+    dropdown: 'Pilih role kamu dari menu di bawah',
+    reaction: 'Beri reaksi untuk ambil role • hapus reaksi untuk melepas'
+  };
+
+  const description = [
+    panel.description,
+    lines.length ? lines.join('\n') : '_Belum ada role di panel ini._'
+  ].filter(Boolean).join('\n\n');
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(panel.title)
+    .setDescription(description.slice(0, 4096))
+    .setFooter({ text: footers[panel.mode] });
+
+  const roleName = item =>
+    guild.roles.cache.get(item.roleId)?.name || 'Role';
+
+  let components = [];
+
+  if (panel.mode === 'button' && panel.items.length) {
+    for (let i = 0; i < panel.items.length; i += 5) {
+      components.push(
+        new ActionRowBuilder().addComponents(
+          panel.items.slice(i, i + 5).map(item => {
+            const button = new ButtonBuilder()
+              .setCustomId(`ry_rr_btn:${item.roleId}`)
+              .setLabel((item.label || roleName(item)).slice(0, 80))
+              .setStyle(ButtonStyle.Secondary);
+
+            if (item.emoji) button.setEmoji(emojiForComponent(item.emoji));
+
+            return button;
+          })
+        )
+      );
+    }
+  }
+
+  if (panel.mode === 'dropdown' && panel.items.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ry_rr_menu')
+      .setPlaceholder('Pilih role kamu...')
+      .setMinValues(0)
+      .setMaxValues(panel.items.length)
+      .addOptions(
+        panel.items.map(item => ({
+          label: (item.label || roleName(item)).slice(0, 100),
+          value: item.roleId,
+          ...(item.description
+            ? { description: item.description.slice(0, 100) }
+            : {}),
+          ...(item.emoji
+            ? { emoji: emojiForComponent(item.emoji) }
+            : {})
+        }))
+      );
+
+    components = [new ActionRowBuilder().addComponents(menu)];
+  }
+
+  return { embeds: [embed], components };
+}
+
+async function fetchRRMessage(panel) {
+  const guild = client.guilds.cache.get(panel.guildId);
+  const channel = guild?.channels.cache.get(panel.channelId);
+
+  if (!channel?.isTextBased()) return null;
+
+  return channel.messages.fetch(panel.messageId).catch(() => null);
+}
+
+// ---------- Penggunaan oleh member ----------
+
+async function handleRRMemberButton(interaction) {
+  const panel = reactionRoles[interaction.message.id];
+  const roleId = interaction.customId.split(':')[1];
+
+  if (
+    !panel ||
+    !panel.items.some(item => item.roleId === roleId)
+  ) {
+    return interaction.reply({
+      content: 'Panel ini sudah tidak aktif.',
+      ephemeral: true
+    });
+  }
+
+  const role = interaction.guild.roles.cache.get(roleId);
+
+  if (!role || checkRoleAssignable(interaction.guild, role)) {
+    return interaction.reply({
+      content: 'Role ini sedang tidak bisa diberikan bot. Hubungi admin.',
+      ephemeral: true
+    });
+  }
+
+  if (interaction.member.roles.cache.has(roleId)) {
+    await interaction.member.roles.remove(role, 'Reaction role RY');
+
+    return interaction.reply({
+      content: `❎ Role **${role.name}** dilepas.`,
+      ephemeral: true
+    });
+  }
+
+  await interaction.member.roles.add(role, 'Reaction role RY');
+
+  return interaction.reply({
+    content: `✅ Role **${role.name}** ditambahkan.`,
+    ephemeral: true
+  });
+}
+
+async function handleRRMemberMenu(interaction) {
+  const panel = reactionRoles[interaction.message.id];
+
+  if (!panel) {
+    return interaction.reply({
+      content: 'Panel ini sudah tidak aktif.',
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const toAdd = [];
+  const toRemove = [];
+
+  for (const item of panel.items) {
+    const role = interaction.guild.roles.cache.get(item.roleId);
+
+    if (!role || checkRoleAssignable(interaction.guild, role)) continue;
+
+    const wanted = interaction.values.includes(item.roleId);
+    const has = interaction.member.roles.cache.has(item.roleId);
+
+    if (wanted && !has) toAdd.push(role);
+    if (!wanted && has) toRemove.push(role);
+  }
+
+  if (toAdd.length) {
+    await interaction.member.roles.add(toAdd, 'Reaction role RY');
+  }
+
+  if (toRemove.length) {
+    await interaction.member.roles.remove(toRemove, 'Reaction role RY');
+  }
+
+  const lines = [];
+
+  if (toAdd.length) {
+    lines.push(`✅ Ditambahkan: ${toAdd.map(role => `**${role.name}**`).join(', ')}`);
+  }
+
+  if (toRemove.length) {
+    lines.push(`❎ Dilepas: ${toRemove.map(role => `**${role.name}**`).join(', ')}`);
+  }
+
+  return interaction.editReply(
+    lines.length ? lines.join('\n') : 'Tidak ada perubahan role.'
+  );
+}
+
+async function handleRRReaction(reaction, user, adding) {
+  if (user.bot) return;
+
+  const panel = reactionRoles[reaction.message.id];
+
+  if (!panel || panel.mode !== 'reaction') return;
+
+  const key = reaction.emoji.id || reaction.emoji.name;
+
+  const item = panel.items.find(
+    entry => entry.emoji && emojiKey(entry.emoji) === key
+  );
+
+  if (!item) return;
+
+  const guild = client.guilds.cache.get(panel.guildId);
+  const role = guild?.roles.cache.get(item.roleId);
+
+  if (!guild || !role || checkRoleAssignable(guild, role)) return;
+
+  const member = await guild.members.fetch(user.id).catch(() => null);
+
+  if (!member) return;
+
+  if (adding) {
+    await member.roles.add(role, 'Reaction role RY');
+  } else {
+    await member.roles.remove(role, 'Reaction role RY');
+  }
+}
+
+// ---------- Panel setting (khusus Staff) ----------
+
+async function replyRRPicker(interaction, action, placeholder, intro) {
+  const panels = guildRRPanels(interaction.guild.id).slice(0, 25);
+
+  if (!panels.length) {
+    return interaction.reply({
+      content: 'Belum ada panel reaction role. Klik **Buat Panel** dulu.',
+      ephemeral: true
+    });
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ry_rr_pick:${action}`)
+    .setPlaceholder(placeholder)
+    .addOptions(
+      panels.map(panel => {
+        const channelName =
+          interaction.guild.channels.cache.get(panel.channelId)?.name ||
+          'channel';
+
+        return {
+          label: panel.title.slice(0, 100),
+          description:
+            `${RR_MODE_LABEL[panel.mode]} • ${panel.items.length} role • #${channelName}`.slice(0, 100),
+          value: panel.messageId
+        };
+      })
+    );
+
+  return interaction.reply({
+    content: intro,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    ephemeral: true
+  });
+}
+
+async function handleRRPanelButton(interaction) {
+  switch (interaction.customId) {
+    case 'ry_rr_panel_new': {
+      const menu = new ChannelSelectMenuBuilder()
+        .setCustomId('ry_rr_new_channel')
+        .setPlaceholder('Pilih channel tempat panel dikirim...')
+        .setChannelTypes(
+          ChannelType.GuildText,
+          ChannelType.GuildAnnouncement
+        );
+
+      return interaction.reply({
+        content: '**Langkah 1/3** — pilih channel tujuan panel:',
+        components: [new ActionRowBuilder().addComponents(menu)],
+        ephemeral: true
+      });
+    }
+
+    case 'ry_rr_panel_add':
+      return replyRRPicker(
+        interaction,
+        'add',
+        'Pilih panel...',
+        'Tambah role ke panel mana?'
+      );
+
+    case 'ry_rr_panel_delrole':
+      return replyRRPicker(
+        interaction,
+        'delrole',
+        'Pilih panel...',
+        'Hapus role dari panel mana?'
+      );
+
+    case 'ry_rr_panel_delpanel':
+      return replyRRPicker(
+        interaction,
+        'delpanel',
+        'Pilih panel...',
+        'Panel mana yang mau dihapus?'
+      );
+
+    case 'ry_rr_panel_list': {
+      const panels = guildRRPanels(interaction.guild.id);
+
+      if (!panels.length) {
+        return interaction.reply({
+          content: 'Belum ada panel reaction role.',
+          ephemeral: true
+        });
+      }
+
+      const lines = panels.map(panel =>
+        `• **${panel.title}** (${RR_MODE_LABEL[panel.mode]}) — <#${panel.channelId}> — ${panel.items.length} role — [lihat](${rrPanelLink(panel)})`
+      );
+
+      return interaction.reply({
+        content: lines.join('\n').slice(0, 1900),
+        ephemeral: true
+      });
+    }
+  }
+}
+
+// Langkah 1 selesai: channel dipilih -> pilih tipe panel
+async function handleRRNewChannel(interaction) {
+  const channelId = interaction.values[0];
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`ry_rr_new_mode:button:${channelId}`)
+      .setLabel('Tombol')
+      .setEmoji('🔘')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`ry_rr_new_mode:dropdown:${channelId}`)
+      .setLabel('Dropdown')
+      .setEmoji('📂')
+      .setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`ry_rr_new_mode:reaction:${channelId}`)
+      .setLabel('Reaksi Emoji')
+      .setEmoji('😀')
+      .setStyle(ButtonStyle.Primary)
+  );
+
+  return interaction.update({
+    content:
+      `**Langkah 2/3** — channel: <#${channelId}>\nPilih tipe panel:\n` +
+      '• **Tombol** — klik tombol untuk ambil / lepas role\n' +
+      '• **Dropdown** — pilih role dari satu menu\n' +
+      '• **Reaksi Emoji** — member bereaksi emoji pada pesan',
+    components: [row]
+  });
+}
+
+// Langkah 2 selesai: tipe dipilih -> isi judul & deskripsi
+async function handleRRNewMode(interaction) {
+  const [, mode, channelId] = interaction.customId.split(':');
+
+  return interaction.showModal(
+    buildModal(
+      `ry_rr_modal_new:${mode}:${channelId}`,
+      `Panel ${RR_MODE_LABEL[mode] || ''}`.trim(),
+      [
+        textInput({
+          id: 'title',
+          label: 'Judul Panel',
+          placeholder: 'Contoh: Pilih Role Kamu',
+          max: 100,
+          required: true
+        }),
+        textInput({
+          id: 'description',
+          label: 'Deskripsi (opsional)',
+          style: TextInputStyle.Paragraph,
+          max: 1000
+        })
+      ]
+    )
+  );
+}
+
+// Langkah 3: form judul disubmit -> kirim panel
+async function handleRRNewModal(interaction) {
+  const [, mode, channelId] = interaction.customId.split(':');
+
+  if (!RR_MODE_LABEL[mode]) {
+    return interaction.reply({
+      content: 'Tipe panel tidak valid.',
+      ephemeral: true
+    });
+  }
+
+  const guild = interaction.guild;
+  const channel = guild.channels.cache.get(channelId);
+
+  const required = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.EmbedLinks,
+    PermissionFlagsBits.ReadMessageHistory
+  ];
+
+  if (mode === 'reaction') {
+    required.push(PermissionFlagsBits.AddReactions);
+  }
+
+  if (
+    !channel?.isTextBased() ||
+    !channel.permissionsFor(guild.members.me)?.has(required)
+  ) {
+    return interaction.reply({
+      content: '❌ Bot tidak punya izin yang cukup di channel itu (View Channel, Send Messages, Embed Links, Read Message History' +
+        (mode === 'reaction' ? ', Add Reactions' : '') + ').',
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const panel = {
+    guildId: guild.id,
+    channelId: channel.id,
+    messageId: null,
+    mode,
+    title: interaction.fields.getTextInputValue('title').trim().slice(0, 100),
+    description: interaction.fields.getTextInputValue('description').trim().slice(0, 1000),
+    items: [],
+    createdBy: interaction.user.id,
+    createdAt: Date.now()
+  };
+
+  const sent = await channel.send(buildRRPayload(panel, guild));
+
+  panel.messageId = sent.id;
+  reactionRoles[sent.id] = panel;
+  saveReactionRoles();
+
+  return interaction.editReply(
+    `✅ Panel **${panel.title}** (${RR_MODE_LABEL[mode]}) dibuat di ${channel}: ${sent.url}\n` +
+    '**Langkah 3/3** — klik **Tambah Role** di panel untuk mengisinya.'
+  );
+}
+
+async function handleRRPick(interaction) {
+  const action = interaction.customId.split(':')[1];
+  const panel = reactionRoles[interaction.values[0]];
+
+  if (!panel || panel.guildId !== interaction.guild.id) {
+    return interaction.update({
+      content: 'Panel tidak ditemukan.',
+      components: []
+    });
+  }
+
+  if (action === 'add') {
+    if (panel.items.length >= RR_LIMITS[panel.mode]) {
+      return interaction.update({
+        content: `Panel ini sudah penuh (maksimal ${RR_LIMITS[panel.mode]} role untuk tipe ${RR_MODE_LABEL[panel.mode]}).`,
+        components: []
+      });
+    }
+
+    const menu = new RoleSelectMenuBuilder()
+      .setCustomId(`ry_rr_addrole:${panel.messageId}`)
+      .setPlaceholder('Pilih role yang mau ditambahkan...')
+      .setMinValues(1)
+      .setMaxValues(1);
+
+    return interaction.update({
+      content: `Pilih role untuk panel **${panel.title}**:`,
+      components: [new ActionRowBuilder().addComponents(menu)]
+    });
+  }
+
+  if (action === 'delrole') {
+    if (!panel.items.length) {
+      return interaction.update({
+        content: 'Panel ini belum punya role.',
+        components: []
+      });
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`ry_rr_delitem:${panel.messageId}`)
+      .setPlaceholder('Pilih role yang mau dihapus...')
+      .addOptions(
+        panel.items.map(item => {
+          const roleName =
+            interaction.guild.roles.cache.get(item.roleId)?.name ||
+            'Role (sudah dihapus)';
+
+          return {
+            label: roleName.slice(0, 100),
+            value: item.roleId,
+            ...(item.emoji
+              ? { emoji: emojiForComponent(item.emoji) }
+              : {})
+          };
+        })
+      );
+
+    return interaction.update({
+      content: `Hapus role dari panel **${panel.title}**:`,
+      components: [new ActionRowBuilder().addComponents(menu)]
+    });
+  }
+
+  if (action === 'delpanel') {
+    await interaction.deferUpdate();
+
+    const message = await fetchRRMessage(panel);
+
+    await message?.delete().catch(() => {});
+
+    delete reactionRoles[panel.messageId];
+    saveReactionRoles();
+
+    return interaction.editReply({
+      content: `🗑️ Panel **${panel.title}** dihapus.`,
+      components: []
+    });
+  }
+}
+
+// Role dipilih -> buka form emoji & label
+async function handleRRAddRole(interaction) {
+  const panelId = interaction.customId.split(':')[1];
+  const panel = reactionRoles[panelId];
+  const role = interaction.roles.first();
+
+  if (!panel || panel.guildId !== interaction.guild.id || !role) {
+    return interaction.update({
+      content: 'Panel atau role tidak ditemukan.',
+      components: []
+    });
+  }
+
+  const problem = checkRoleAssignable(interaction.guild, role);
+
+  if (problem) {
+    return interaction.update({
+      content: `❌ ${problem}`,
+      components: []
+    });
+  }
+
+  if (panel.items.some(item => item.roleId === role.id)) {
+    return interaction.update({
+      content: 'Role itu sudah ada di panel ini.',
+      components: []
+    });
+  }
+
+  const rows = [
+    textInput({
+      id: 'emoji',
+      label: panel.mode === 'reaction' ? 'Emoji (wajib)' : 'Emoji (opsional)',
+      placeholder: 'Contoh: 🎮 atau <:nama:123456789012345678>',
+      max: 60,
+      required: panel.mode === 'reaction'
+    }),
+    textInput({
+      id: 'label',
+      label: 'Label (kosongkan = nama role)',
+      max: 80
+    })
+  ];
+
+  if (panel.mode === 'dropdown') {
+    rows.push(
+      textInput({
+        id: 'description',
+        label: 'Deskripsi (opsional)',
+        max: 100
+      })
+    );
+  }
+
+  return interaction.showModal(
+    buildModal(
+      `ry_rr_modal_item:${panelId}:${role.id}`,
+      'Detail Role',
+      rows
+    )
+  );
+}
+
+// Form emoji & label disubmit -> tambahkan ke panel
+async function handleRRItemModal(interaction) {
+  const [, panelId, roleId] = interaction.customId.split(':');
+  const guild = interaction.guild;
+  const panel = reactionRoles[panelId];
+  const role = guild.roles.cache.get(roleId);
+
+  if (!panel || panel.guildId !== guild.id || !role) {
+    return interaction.reply({
+      content: 'Panel atau role tidak ditemukan.',
+      ephemeral: true
+    });
+  }
+
+  const problem = checkRoleAssignable(guild, role);
+
+  if (problem) {
+    return interaction.reply({ content: `❌ ${problem}`, ephemeral: true });
+  }
+
+  if (
+    panel.items.some(item => item.roleId === roleId) ||
+    panel.items.length >= RR_LIMITS[panel.mode]
+  ) {
+    return interaction.reply({
+      content: 'Role sudah ada di panel, atau panel sudah penuh.',
+      ephemeral: true
+    });
+  }
+
+  const emoji = parseEmoji(interaction.fields.getTextInputValue('emoji'));
+  const label = interaction.fields.getTextInputValue('label').trim().slice(0, 80);
+
+  const description = panel.mode === 'dropdown'
+    ? interaction.fields.getTextInputValue('description').trim().slice(0, 100)
+    : '';
+
+  if (panel.mode === 'reaction' && !emoji) {
+    return interaction.reply({
+      content: '❌ Panel tipe Reaksi Emoji wajib memakai emoji.',
+      ephemeral: true
+    });
+  }
+
+  if (emoji && !emoji.id && !UNICODE_EMOJI_REGEX.test(emoji.name)) {
+    return interaction.reply({
+      content: '❌ Emoji tidak valid. Pakai emoji biasa (🎮) atau emoji custom server (<:nama:id>).',
+      ephemeral: true
+    });
+  }
+
+  if (
+    panel.mode === 'reaction' &&
+    panel.items.some(
+      item => item.emoji && emojiKey(item.emoji) === emojiKey(emoji)
+    )
+  ) {
+    return interaction.reply({
+      content: '❌ Emoji itu sudah dipakai role lain di panel ini.',
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const message = await fetchRRMessage(panel);
+
+  if (!message) {
+    return interaction.editReply(
+      '❌ Pesan panel tidak ditemukan (mungkin terhapus). Buat panel baru.'
+    );
+  }
+
+  if (panel.mode === 'reaction') {
+    try {
+      await message.react(emojiReactRef(emoji));
+    } catch {
+      return interaction.editReply(
+        '❌ Bot tidak bisa memakai emoji itu. Kalau emoji custom, pastikan emoji berasal dari server yang bot ikuti.'
+      );
+    }
+  }
+
+  panel.items.push({
+    roleId,
+    emoji: emoji || null,
+    label,
+    description
+  });
+
+  try {
+    await message.edit(buildRRPayload(panel, guild));
+  } catch (error) {
+    panel.items.pop();
+
+    return interaction.editReply(
+      `❌ Gagal memperbarui panel: ${error.message}`
+    );
+  }
+
+  saveReactionRoles();
+
+  return interaction.editReply(
+    `✅ Role **${role.name}** ditambahkan ke panel **${panel.title}**.`
+  );
+}
+
+async function handleRRDelItem(interaction) {
+  const panelId = interaction.customId.split(':')[1];
+  const panel = reactionRoles[panelId];
+  const roleId = interaction.values[0];
+
+  await interaction.deferUpdate();
+
+  const index = panel
+    ? panel.items.findIndex(item => item.roleId === roleId)
+    : -1;
+
+  if (!panel || panel.guildId !== interaction.guild.id || index < 0) {
+    return interaction.editReply({
+      content: 'Role tidak ditemukan di panel.',
+      components: []
+    });
+  }
+
+  const [removed] = panel.items.splice(index, 1);
+
+  saveReactionRoles();
+
+  const message = await fetchRRMessage(panel);
+
+  if (message) {
+    await message
+      .edit(buildRRPayload(panel, interaction.guild))
+      .catch(console.error);
+
+    if (panel.mode === 'reaction' && removed.emoji) {
+      const key = emojiKey(removed.emoji);
+
+      await message.reactions.cache
+        .find(reaction => (reaction.emoji.id || reaction.emoji.name) === key)
+        ?.remove()
+        .catch(() => {});
+    }
+  }
+
+  return interaction.editReply({
+    content: '✅ Role dihapus dari panel.',
+    components: []
+  });
+}
+
+async function routeReactionRole(interaction) {
+  const id = interaction.customId;
+
+  if (typeof id !== 'string' || !id.startsWith('ry_rr_')) {
+    return false;
+  }
+
+  // Dipakai member biasa (tanpa cek Staff)
+  if (interaction.isButton() && id.startsWith('ry_rr_btn:')) {
+    await handleRRMemberButton(interaction);
+    return true;
+  }
+
+  if (interaction.isStringSelectMenu() && id === 'ry_rr_menu') {
+    await handleRRMemberMenu(interaction);
+    return true;
+  }
+
+  // Selebihnya khusus admin / Staff
+  if (!isStaff(interaction.member)) {
+    await interaction.reply({
+      content: 'Fitur ini hanya untuk admin atau Staff.',
+      ephemeral: true
+    });
+
+    return true;
+  }
+
+  if (interaction.isButton()) {
+    if (id.startsWith('ry_rr_new_mode:')) {
+      await handleRRNewMode(interaction);
+    } else {
+      await handleRRPanelButton(interaction);
+    }
+
+    return true;
+  }
+
+  if (interaction.isChannelSelectMenu() && id === 'ry_rr_new_channel') {
+    await handleRRNewChannel(interaction);
+    return true;
+  }
+
+  if (interaction.isRoleSelectMenu() && id.startsWith('ry_rr_addrole:')) {
+    await handleRRAddRole(interaction);
+    return true;
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    if (id.startsWith('ry_rr_pick:')) {
+      await handleRRPick(interaction);
+    } else if (id.startsWith('ry_rr_delitem:')) {
+      await handleRRDelItem(interaction);
+    }
+
+    return true;
+  }
+
+  if (interaction.isModalSubmit()) {
+    if (id.startsWith('ry_rr_modal_new:')) {
+      await handleRRNewModal(interaction);
+    } else if (id.startsWith('ry_rr_modal_item:')) {
+      await handleRRItemModal(interaction);
+    }
+
+    return true;
+  }
+
+  return true;
 }
 
 // ===============================
@@ -1863,12 +4026,17 @@ client.once('ready', () => {
     );
   }
 
+  // Daftarkan slash command di semua server (langsung aktif)
+  for (const guild of client.guilds.cache.values()) {
+    registerSlashCommands(guild);
+  }
+
   // Cek giveaway yang udah waktunya berakhir (tahan restart bot)
   checkGiveaways();
   setInterval(checkGiveaways, 10000);
 
   client.user.setPresence({
-    activities: [{ name: 'ry!help | RY Support' }],
+    activities: [{ name: '/help | RY Support' }],
     status: 'online'
   });
 });
@@ -1907,278 +4075,21 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 // ===============================
-// PREFIX COMMANDS
-// ===============================
-
-client.on('messageCreate', async message => {
-  if (
-    !message.guild ||
-    message.author.bot ||
-    !message.content.startsWith(PREFIX)
-  ) {
-    return;
-  }
-
-  const [rawCommand, ...args] = message.content
-    .slice(PREFIX.length)
-    .trim()
-    .split(/\s+/);
-
-  const command = (rawCommand || '').toLowerCase();
-
-  // HELP
-  if (command === 'help') {
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle('RY Bot Commands')
-      .setDescription([
-        '`ry!setup all` — setup semua sistem',
-        '`ry!setup welcome` — setup welcome',
-        '`ry!setup ticket` — setup ticket',
-        '`ry!setup vouches` — setup vouches',
-        '`ry!setup giveaway` — setup giveaway (rundown, history, setting)',
-        '`ry!welcome test` — tes audio welcome.mp3',
-        '`ry!vouches <gambar> @buyer <produk> <harga> <done/pending>`',
-        '`ry!ticket close` — tutup ticket'
-      ].join('\n'));
-
-    return message.reply({ embeds: [embed] });
-  }
-
-  // SETUP
-  if (command === 'setup') {
-    if (!isStaff(message.member)) {
-      return message.reply(
-        'Command setup hanya untuk admin atau Staff.'
-      );
-    }
-
-    const target = (args[0] || '').toLowerCase();
-
-    try {
-      if (target === 'welcome') {
-        const result = await setupWelcome(message.guild);
-
-        return message.reply(
-          `Welcome siap! Voice channel: ${result.voice}. Role: ${result.verifiedRole.name}.`
-        );
-      }
-
-      if (target === 'ticket') {
-        const result = await setupTicket(message.guild);
-
-        return message.reply(
-          `Ticket siap! Panel: ${result.panel}. Log: ${result.logs}. Tambahkan staff ke role ${result.staffRole.name}.`
-        );
-      }
-
-      if (target === 'vouches') {
-        const channel = await setupVouches(message.guild);
-
-        return message.reply(
-          `Channel vouches siap: ${channel}`
-        );
-      }
-
-      if (target === 'giveaway') {
-        const result = await setupGiveaway(message.guild);
-
-        return message.reply(
-          `Giveaway siap! Rundown: ${result.rundown}. History: ${result.history}. Panel kontrol (khusus Staff): ${result.setting}.`
-        );
-      }
-
-      if (target === 'all') {
-        const result = await setupAll(message.guild);
-
-        return message.reply(
-          `Setup RY selesai!\n` +
-          `Welcome: ${result.welcome.voice}\n` +
-          `Ticket: ${result.ticket.panel}\n` +
-          `Logs: ${result.ticket.logs}\n` +
-          `Vouches: ${result.vouches}\n` +
-          `Giveaway: ${result.giveaway.setting}\n\n` +
-          `Atur permission channel member agar role Verified mendapat akses.`
-        );
-      }
-
-      return message.reply(
-        'Gunakan ry!setup all, welcome, ticket, vouches, atau giveaway.'
-      );
-    } catch (error) {
-      console.error(error);
-
-      return message.reply(
-        'Setup gagal. Periksa izin bot dan console VPS.'
-      );
-    }
-  }
-
-  // TES AUDIO WELCOME (MP3)
-  if (
-    command === 'welcome' &&
-    (args[0] || '').toLowerCase() === 'test'
-  ) {
-    if (!isStaff(message.member)) {
-      return message.reply('Khusus admin atau Staff.');
-    }
-
-    const voiceChannel = message.member.voice.channel;
-
-    if (!voiceChannel) {
-      return message.reply(
-        'Masuk voice channel dulu, lalu jalankan ry!welcome test.'
-      );
-    }
-
-    try {
-      await message.reply('Memutar welcome.mp3...');
-
-      await playWelcomeAudio(voiceChannel);
-
-      await message.channel.send('Tes audio selesai.');
-    } catch (error) {
-      console.error(error);
-
-      await message.reply(
-        `Audio gagal: ${error.message}\n` +
-        'Cek juga FFmpeg, izin Connect serta Speak, dan lokasi welcome.mp3.'
-      );
-    }
-
-    return;
-  }
-
-  // VOUCHES
-  if (command === 'vouches') {
-    if (!isStaff(message.member)) {
-      return message.reply(
-        'Command vouches hanya untuk admin atau Staff.'
-      );
-    }
-
-    const cfg = guildConfig(message.guild.id);
-
-    const targetChannel = cfg.vouchesChannelId
-      ? message.guild.channels.cache.get(cfg.vouchesChannelId)
-      : null;
-
-    if (!targetChannel?.isTextBased()) {
-      return message.reply(
-        'Jalankan ry!setup vouches terlebih dahulu.'
-      );
-    }
-
-    const attachment = message.attachments.find(
-      item => item.contentType?.startsWith('image/')
-    );
-
-    const parsed = parseVouchArgs(
-      message.content,
-      attachment?.url
-    );
-
-    if (!parsed) {
-      return message.reply(
-        'Format:\n' +
-        '`ry!vouches https://link-gambar.png @buyer Nama Produk 150000 done`\n' +
-        'Status terakhir harus done atau pending.'
-      );
-    }
-
-    const buyer = await message.guild.members.fetch(
-      parsed.buyerId
-    ).catch(() => null);
-
-    if (!buyer) {
-      return message.reply(
-        'Buyer tidak ditemukan di server.'
-      );
-    }
-
-    const done = parsed.status === 'done';
-
-    const embed = new EmbedBuilder()
-      .setColor(done ? 0x57f287 : 0xfee75c)
-      .setTitle('🧾 Vouches Transaksi')
-      .addFields(
-        {
-          name: 'Buyer',
-          value: `${buyer}`,
-          inline: true
-        },
-        {
-          name: 'Produk',
-          value: parsed.product.slice(0, 1024),
-          inline: true
-        },
-        {
-          name: 'Total Harga',
-          value: moneyIDR(parsed.price),
-          inline: true
-        },
-        {
-          name: 'Status',
-          value: done ? '✅ DONE' : '🕒 PENDING',
-          inline: true
-        },
-        {
-          name: 'Dicatat oleh',
-          value: `${message.author}`,
-          inline: true
-        }
-      )
-      .setImage(parsed.imageUrl)
-      .setFooter({ text: 'RY Vouches' })
-      .setTimestamp();
-
-    await targetChannel.send({
-      embeds: [embed],
-      allowedMentions: { users: [] }
-    });
-
-    return message.reply(
-      `Vouches berhasil dikirim ke ${targetChannel}.`
-    );
-  }
-
-  // TUTUP TICKET VIA COMMAND
-  if (
-    command === 'ticket' &&
-    (args[0] || '').toLowerCase() === 'close'
-  ) {
-    const ownerMatch = message.channel.topic?.match(
-      /ticket-owner:(\d+)/
-    );
-
-    const isOwner = ownerMatch?.[1] === message.author.id;
-
-    if (!ownerMatch) {
-      return message.reply(
-        'Command ini hanya bisa dipakai di channel ticket.'
-      );
-    }
-
-    if (!isOwner && !isStaff(message.member)) {
-      return message.reply(
-        'Hanya pembuat ticket atau staff yang bisa menutupnya.'
-      );
-    }
-
-    await message.reply(
-      'Ticket ditutup. Transcript sedang dibuat...'
-    );
-
-    await closeTicket(message.channel, message.author);
-  }
-});
-
-// ===============================
 // TOMBOL DAN MENU INTERAKSI
 // ===============================
 
 client.on('interactionCreate', async interaction => {
   try {
+    // Slash command
+    if (interaction.isChatInputCommand()) {
+      await handleSlashCommand(interaction);
+      return;
+    }
+
+    // Hook (embed builder) dan Reaction Role
+    if (await routeHook(interaction)) return;
+    if (await routeReactionRole(interaction)) return;
+
     if (
       interaction.isStringSelectMenu() &&
       interaction.customId === 'ry_ticket_category'
@@ -2309,16 +4220,40 @@ client.on('interactionCreate', async interaction => {
   } catch (error) {
     console.error('Interaction error:', error);
 
-    if (
-      interaction.isRepliable() &&
-      !interaction.replied &&
-      !interaction.deferred
-    ) {
-      await interaction.reply({
+    if (interaction.isRepliable()) {
+      const errorMessage = {
         content: 'Terjadi error. Hubungi admin.',
         ephemeral: true
-      }).catch(() => {});
+      };
+
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp(errorMessage).catch(() => {});
+      } else {
+        await interaction.reply(errorMessage).catch(() => {});
+      }
     }
+  }
+});
+
+// Server baru: daftarkan slash command
+client.on('guildCreate', guild => {
+  registerSlashCommands(guild);
+});
+
+// Reaction role (tipe reaksi emoji)
+client.on('messageReactionAdd', (reaction, user) => {
+  handleRRReaction(reaction, user, true).catch(console.error);
+});
+
+client.on('messageReactionRemove', (reaction, user) => {
+  handleRRReaction(reaction, user, false).catch(console.error);
+});
+
+// Panel reaction role dihapus manual -> bersihin datanya
+client.on('messageDelete', message => {
+  if (reactionRoles[message.id]) {
+    delete reactionRoles[message.id];
+    saveReactionRoles();
   }
 });
 
