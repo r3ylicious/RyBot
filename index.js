@@ -3,6 +3,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const { randomInt } = require('node:crypto');
 
 const {
   Client,
@@ -15,7 +16,10 @@ const {
   ButtonBuilder,
   ButtonStyle,
   StringSelectMenuBuilder,
-  AttachmentBuilder
+  AttachmentBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle
 } = require('discord.js');
 
 const {
@@ -82,6 +86,42 @@ const welcomeQueue = new Map();
 const welcomeBusy = new Set();
 const ticketCreateLocks = new Set();
 
+// ===============================
+// DATA GIVEAWAY
+// ===============================
+
+const GIVEAWAYS_PATH = path.join(ROOT, 'giveaways.json');
+const GIVEAWAY_KEEP_DAYS = 30;
+
+let giveaways = {};
+
+if (fs.existsSync(GIVEAWAYS_PATH)) {
+  try {
+    giveaways = JSON.parse(
+      fs.readFileSync(GIVEAWAYS_PATH, 'utf8')
+    );
+
+    // Bersihin giveaway lama yang udah berakhir
+    const limit = Date.now() - GIVEAWAY_KEEP_DAYS * 86400000;
+
+    for (const [id, gw] of Object.entries(giveaways)) {
+      if (gw.ended && gw.endsAt < limit) delete giveaways[id];
+    }
+  } catch (error) {
+    console.error('Gagal membaca giveaways.json:', error);
+  }
+}
+
+const giveawayRefreshTimers = new Map();
+const giveawayEnding = new Set();
+
+function saveGiveaways() {
+  fs.writeFileSync(
+    GIVEAWAYS_PATH,
+    JSON.stringify(giveaways, null, 2)
+  );
+}
+
 function saveConfig() {
   fs.writeFileSync(
     CONFIG_PATH,
@@ -100,6 +140,8 @@ function guildConfig(guildId) {
 function isStaff(member) {
   if (!member) return false;
 
+  const cfg = guildConfig(member.guild.id);
+
   return (
     member.permissions.has(
       PermissionFlagsBits.Administrator
@@ -107,6 +149,12 @@ function isStaff(member) {
     member.permissions.has(
       PermissionFlagsBits.ManageGuild
     ) ||
+    // Cek lewat ID role (aman walau role di-rename)
+    Boolean(
+      cfg.staffRoleId &&
+      member.roles.cache.has(cfg.staffRoleId)
+    ) ||
+    // Cadangan: cek lewat nama role dari .env
     member.roles.cache.some(
       role => role.name === STAFF_ROLE_NAME
     )
@@ -342,12 +390,177 @@ async function setupVouches(guild) {
   return channel;
 }
 
+// ===============================
+// SETUP GIVEAWAY
+// ===============================
+
+async function setupGiveaway(guild) {
+  const cfg = guildConfig(guild.id);
+
+  // Pakai role Staff yang udah ada (lewat ID), jangan bikin dobel
+  const staffRole =
+    (cfg.staffRoleId && guild.roles.cache.get(cfg.staffRoleId)) ||
+    await findOrCreateRole(guild, STAFF_ROLE_NAME, {
+      color: 0x5865f2
+    });
+
+  cfg.staffRoleId = staffRole.id;
+
+  const category = await findOrCreateCategory(
+    guild,
+    '・ー ✧ Give Away ✧ ー・'
+  );
+
+  const botPermissions = {
+    id: client.user.id,
+    allow: [
+      PermissionFlagsBits.ViewChannel,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.EmbedLinks,
+      PermissionFlagsBits.ReadMessageHistory
+    ]
+  };
+
+  // Rundown & history: semua bisa lihat, tapi cuma bot yang bisa kirim pesan
+  const readOnly = [
+    {
+      id: guild.roles.everyone.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.ReadMessageHistory
+      ],
+      deny: [
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.AddReactions
+      ]
+    },
+    botPermissions
+  ];
+
+  const rundown = await findOrCreateChannel(
+    guild,
+    '╭⋅🎁┊giveaway',
+    ChannelType.GuildText,
+    {
+      parent: category.id,
+      topic: 'Giveaway yang sedang berlangsung. Klik tombol untuk ikut!',
+      permissionOverwrites: readOnly
+    }
+  );
+
+  const history = await findOrCreateChannel(
+    guild,
+    '┣⋅📜┊giveaway-history',
+    ChannelType.GuildText,
+    {
+      parent: category.id,
+      topic: 'Riwayat giveaway yang sudah selesai.',
+      permissionOverwrites: readOnly
+    }
+  );
+
+  // Setting: khusus admin & Staff
+  const setting = await findOrCreateChannel(
+    guild,
+    '╰⋅⚙️┊giveaway-setting',
+    ChannelType.GuildText,
+    {
+      parent: category.id,
+      topic: 'Panel khusus Staff untuk mengelola giveaway.',
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+          id: staffRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ReadMessageHistory
+          ],
+          deny: [PermissionFlagsBits.SendMessages]
+        },
+        botPermissions
+      ]
+    }
+  );
+
+  cfg.giveawayCategoryId = category.id;
+  cfg.giveawayRundownChannelId = rundown.id;
+  cfg.giveawayHistoryChannelId = history.id;
+  cfg.giveawaySettingChannelId = setting.id;
+
+  saveConfig();
+
+  const recent = await setting.messages.fetch({
+    limit: 20
+  }).catch(() => null);
+
+  const exists = recent?.some(message =>
+    message.author.id === client.user.id &&
+    message.components.some(row =>
+      row.components.some(
+        component =>
+          component.customId === 'ry_gw_panel_create'
+      )
+    )
+  );
+
+  if (!exists) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🎁 Giveaway Control Panel')
+      .setDescription(
+        'Kelola giveaway server dari sini.\n\n' +
+        '🎉 **Buat Giveaway** — isi form, giveaway langsung tayang di rundown\n' +
+        '⏹️ **Akhiri** — hentikan giveaway lebih awal\n' +
+        '🔄 **Reroll** — pilih pemenang baru\n' +
+        '📋 **Daftar** — lihat giveaway yang sedang berjalan'
+      )
+      .setFooter({ text: 'RY Giveaway System' });
+
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_gw_panel_create')
+        .setLabel('Buat Giveaway')
+        .setEmoji('🎉')
+        .setStyle(ButtonStyle.Success),
+
+      new ButtonBuilder()
+        .setCustomId('ry_gw_panel_end')
+        .setLabel('Akhiri')
+        .setEmoji('⏹️')
+        .setStyle(ButtonStyle.Danger),
+
+      new ButtonBuilder()
+        .setCustomId('ry_gw_panel_reroll')
+        .setLabel('Reroll')
+        .setEmoji('🔄')
+        .setStyle(ButtonStyle.Primary),
+
+      new ButtonBuilder()
+        .setCustomId('ry_gw_panel_list')
+        .setLabel('Daftar')
+        .setEmoji('📋')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    await setting.send({
+      embeds: [embed],
+      components: [buttons]
+    });
+  }
+
+  return { staffRole, category, rundown, history, setting };
+}
+
 async function setupAll(guild) {
   const welcome = await setupWelcome(guild);
   const ticket = await setupTicket(guild);
   const vouches = await setupVouches(guild);
+  const giveaway = await setupGiveaway(guild);
 
-  return { welcome, ticket, vouches };
+  return { welcome, ticket, vouches, giveaway };
 }
 
 // ===============================
@@ -520,20 +733,32 @@ async function processWelcomeQueue(guild) {
           member.id
         ).catch(() => null);
 
-        // 3. Baru kasih role
         if (
           refreshed &&
-          refreshed.voice.channelId === item.channelId &&
-          !refreshed.roles.cache.has(verifiedRole.id)
+          refreshed.voice.channelId === item.channelId
         ) {
-          await refreshed.roles.add(
-            verifiedRole,
-            'Selesai audio welcome RY'
-          );
+          // 3. Baru kasih role
+          if (!refreshed.roles.cache.has(verifiedRole.id)) {
+            await refreshed.roles.add(
+              verifiedRole,
+              'Selesai audio welcome RY'
+            );
 
-          await refreshed.send(
-            `Selamat datang di ${guild.name}! Role ${verifiedRole.name} sudah diberikan.`
-          ).catch(() => {});
+            await refreshed.send(
+              `Selamat datang di ${guild.name}! Role ${verifiedRole.name} sudah diberikan.`
+            ).catch(() => {});
+          }
+
+          // 4. Setelah dapet role, member langsung di-disconnect dari voice
+          //    (bot butuh izin Move Members)
+          await refreshed.voice
+            .disconnect('Selesai audio welcome RY')
+            .catch(error =>
+              console.error(
+                'Gagal disconnect member dari voice:',
+                error.message
+              )
+            );
         }
       } catch (error) {
         console.error('Welcome audio gagal:', error);
@@ -542,6 +767,741 @@ async function processWelcomeQueue(guild) {
   } finally {
     welcomeBusy.delete(guildId);
   }
+}
+
+// ===============================
+// GIVEAWAY
+// ===============================
+
+// Parser durasi: 30s, 10m, 2h, 1d, atau gabungan seperti 1d12h
+function parseDuration(text) {
+  if (!text) return null;
+
+  const units = {
+    s: 1000,
+    m: 60000,
+    h: 3600000,
+    d: 86400000
+  };
+
+  const regex = /(\d+)([smhd])/gi;
+  let total = 0;
+  let matched = '';
+  let part;
+
+  while ((part = regex.exec(text)) !== null) {
+    total += Number(part[1]) * units[part[2].toLowerCase()];
+    matched += part[0];
+  }
+
+  if (!total || matched.length !== text.length) return null;
+
+  return total;
+}
+
+function buildGiveawayEmbed(gw) {
+  const endUnix = Math.floor(gw.endsAt / 1000);
+
+  const embed = new EmbedBuilder()
+    .setTitle(gw.ended ? '🏆 GIVEAWAY BERAKHIR' : '🎉 GIVEAWAY')
+    .setFooter({
+      text: gw.messageId
+        ? `RY Giveaway • ID: ${gw.messageId}`
+        : 'RY Giveaway'
+    })
+    .setTimestamp(gw.endsAt);
+
+  if (!gw.ended) {
+    return embed
+      .setColor(0x5865f2)
+      .setDescription(
+        `### ${gw.prize}\n` +
+        (gw.note ? `${gw.note}\n\n` : '') +
+        'Klik tombol **Ikut Giveaway** di bawah untuk berpartisipasi.'
+      )
+      .addFields(
+        {
+          name: '⏳ Berakhir',
+          value: `<t:${endUnix}:R>\n<t:${endUnix}:f>`,
+          inline: true
+        },
+        {
+          name: '🏅 Pemenang',
+          value: String(gw.winners),
+          inline: true
+        },
+        {
+          name: '👥 Peserta',
+          value: String(gw.entries.length),
+          inline: true
+        },
+        {
+          name: '👑 Host',
+          value: `<@${gw.hostId}>`,
+          inline: true
+        }
+      );
+  }
+
+  const winnersText = gw.winnerIds.length
+    ? gw.winnerIds.map(id => `<@${id}>`).join('\n')
+    : 'Tidak ada peserta valid';
+
+  return embed
+    .setColor(gw.winnerIds.length ? 0x57f287 : 0xed4245)
+    .setDescription(`### ${gw.prize}`)
+    .addFields(
+      {
+        name: '🏆 Pemenang',
+        value: winnersText.slice(0, 1024)
+      },
+      {
+        name: '👥 Peserta',
+        value: String(gw.entries.length),
+        inline: true
+      },
+      {
+        name: '👑 Host',
+        value: `<@${gw.hostId}>`,
+        inline: true
+      },
+      {
+        name: '⏱️ Berakhir',
+        value: `<t:${endUnix}:f>`,
+        inline: true
+      }
+    );
+}
+
+function giveawayComponents(gw) {
+  const button = new ButtonBuilder()
+    .setCustomId('ry_gw_join')
+    .setEmoji('🎉');
+
+  if (gw.ended) {
+    button
+      .setLabel('Giveaway Berakhir')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(true);
+  } else {
+    button
+      .setLabel(`Ikut Giveaway (${gw.entries.length})`)
+      .setStyle(ButtonStyle.Primary);
+  }
+
+  return [new ActionRowBuilder().addComponents(button)];
+}
+
+async function fetchGiveawayMessage(gw) {
+  const guild = client.guilds.cache.get(gw.guildId);
+  const channel = guild?.channels.cache.get(gw.channelId);
+
+  if (!channel?.isTextBased()) return null;
+
+  return channel.messages.fetch(gw.messageId).catch(() => null);
+}
+
+async function refreshGiveawayMessage(gw) {
+  const msg = await fetchGiveawayMessage(gw);
+
+  if (!msg) return null;
+
+  await msg.edit({
+    embeds: [buildGiveawayEmbed(gw)],
+    components: giveawayComponents(gw)
+  }).catch(console.error);
+
+  return msg;
+}
+
+// Update tampilan (jumlah peserta) maksimal tiap 3 detik
+// biar nggak kena rate limit kalau banyak yang klik bareng.
+function scheduleGiveawayRefresh(gw) {
+  if (giveawayRefreshTimers.has(gw.messageId)) return;
+
+  giveawayRefreshTimers.set(
+    gw.messageId,
+    setTimeout(() => {
+      giveawayRefreshTimers.delete(gw.messageId);
+
+      if (!gw.ended) refreshGiveawayMessage(gw);
+    }, 3000)
+  );
+}
+
+async function pickWinners(guild, pool, count) {
+  const shuffled = [...pool];
+
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+
+  const winners = [];
+
+  for (const id of shuffled) {
+    if (winners.length >= count) break;
+
+    const member = await guild.members.fetch(id).catch(() => null);
+
+    if (member && !member.user.bot) winners.push(id);
+  }
+
+  return winners;
+}
+
+async function announceGiveaway(msg, channel, gw, winnerIds, isReroll) {
+  const mentions = winnerIds.map(id => `<@${id}>`).join(', ');
+
+  const content = winnerIds.length
+    ? `${isReroll ? '🔄 Reroll! ' : ''}🎉 Selamat ${mentions}! Kamu memenangkan **${gw.prize}**!`
+    : `😢 Giveaway **${gw.prize}** berakhir tanpa pemenang karena tidak ada peserta valid.`;
+
+  const options = {
+    content,
+    allowedMentions: { users: winnerIds }
+  };
+
+  if (msg) {
+    await msg.reply(options).catch(() =>
+      channel.send(options).catch(() => {})
+    );
+  } else {
+    await channel.send(options).catch(() => {});
+  }
+}
+
+function notifyGiveawayWinners(guild, gw, winnerIds) {
+  for (const id of winnerIds) {
+    client.users.fetch(id)
+      .then(user =>
+        user.send(
+          `🎉 Selamat! Kamu memenangkan **${gw.prize}** di ${guild.name}.`
+        )
+      )
+      .catch(() => {});
+  }
+}
+
+async function endGiveaway(gw) {
+  if (gw.ended || giveawayEnding.has(gw.messageId)) return false;
+
+  giveawayEnding.add(gw.messageId);
+
+  try {
+    clearTimeout(giveawayRefreshTimers.get(gw.messageId));
+    giveawayRefreshTimers.delete(gw.messageId);
+
+    const guild = client.guilds.cache.get(gw.guildId);
+
+    if (!guild) {
+      gw.ended = true;
+      saveGiveaways();
+      return true;
+    }
+
+    gw.winnerIds = await pickWinners(
+      guild,
+      gw.entries,
+      gw.winners
+    );
+
+    gw.ended = true;
+    saveGiveaways();
+
+    const msg = await refreshGiveawayMessage(gw);
+    const channel = guild.channels.cache.get(gw.channelId);
+
+    if (channel?.isTextBased()) {
+      await announceGiveaway(msg, channel, gw, gw.winnerIds, false);
+    }
+
+    await logGiveawayHistory(guild, gw, gw.winnerIds, false);
+
+    notifyGiveawayWinners(guild, gw, gw.winnerIds);
+
+    return true;
+  } finally {
+    giveawayEnding.delete(gw.messageId);
+  }
+}
+
+async function rerollGiveaway(gw, count) {
+  const guild = client.guilds.cache.get(gw.guildId);
+
+  if (!guild) return null;
+
+  const pool = gw.entries.filter(
+    id => !gw.winnerIds.includes(id)
+  );
+
+  const picked = await pickWinners(guild, pool, count);
+
+  if (!picked.length) return null;
+
+  gw.winnerIds.push(...picked);
+  saveGiveaways();
+
+  const msg = await refreshGiveawayMessage(gw);
+  const channel = guild.channels.cache.get(gw.channelId);
+
+  if (channel?.isTextBased()) {
+    await announceGiveaway(msg, channel, gw, picked, true);
+  }
+
+  await logGiveawayHistory(guild, gw, picked, true);
+
+  notifyGiveawayWinners(guild, gw, picked);
+
+  return picked;
+}
+
+// Daftar giveaway server ini (maks 25, buat menu pilihan), terbaru dulu
+function guildGiveaways(guildId, ended) {
+  return Object.values(giveaways)
+    .filter(gw => gw.guildId === guildId && gw.ended === ended)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 25);
+}
+
+function giveawayLink(gw) {
+  return `https://discord.com/channels/${gw.guildId}/${gw.channelId}/${gw.messageId}`;
+}
+
+// Catat hasil giveaway (atau reroll) ke channel history
+async function logGiveawayHistory(guild, gw, winnerIds, isReroll) {
+  const cfg = guildConfig(guild.id);
+
+  const channel = cfg.giveawayHistoryChannelId
+    ? guild.channels.cache.get(cfg.giveawayHistoryChannelId)
+    : null;
+
+  if (!channel?.isTextBased()) return;
+
+  const winnersText = winnerIds.length
+    ? winnerIds.map(id => `<@${id}>`).join('\n')
+    : 'Tidak ada peserta valid';
+
+  const embed = new EmbedBuilder()
+    .setColor(
+      isReroll ? 0xfee75c : (winnerIds.length ? 0x57f287 : 0xed4245)
+    )
+    .setTitle(isReroll ? '🔄 Reroll Giveaway' : '📜 Giveaway Selesai')
+    .setDescription(`### ${gw.prize}`)
+    .addFields(
+      {
+        name: isReroll ? '🏆 Pemenang Baru' : '🏆 Pemenang',
+        value: winnersText.slice(0, 1024)
+      },
+      {
+        name: '👥 Peserta',
+        value: String(gw.entries.length),
+        inline: true
+      },
+      {
+        name: '👑 Host',
+        value: `<@${gw.hostId}>`,
+        inline: true
+      },
+      {
+        name: '🔗 Pesan',
+        value: `[Lihat giveaway](${giveawayLink(gw)})`,
+        inline: true
+      }
+    )
+    .setFooter({ text: `RY Giveaway • ID: ${gw.messageId}` })
+    .setTimestamp();
+
+  await channel.send({
+    embeds: [embed],
+    allowedMentions: { parse: [] }
+  }).catch(console.error);
+}
+
+// Tombol di panel giveaway-setting
+async function handleGiveawayPanel(interaction) {
+  if (!isStaff(interaction.member)) {
+    return interaction.reply({
+      content: 'Panel ini hanya untuk admin atau Staff.',
+      ephemeral: true
+    });
+  }
+
+  const guildId = interaction.guild.id;
+
+  // Buka form buat giveaway
+  if (interaction.customId === 'ry_gw_panel_create') {
+    const modal = new ModalBuilder()
+      .setCustomId('ry_gw_modal_create')
+      .setTitle('Buat Giveaway Baru')
+      .addComponents(
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('prize')
+            .setLabel('Hadiah')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('Contoh: Nitro Classic 1 Bulan')
+            .setMaxLength(100)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('duration')
+            .setLabel('Durasi')
+            .setStyle(TextInputStyle.Short)
+            .setPlaceholder('30m, 2h, 1d, atau 1d12h')
+            .setMaxLength(12)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('winners')
+            .setLabel('Jumlah Pemenang')
+            .setStyle(TextInputStyle.Short)
+            .setValue('1')
+            .setMaxLength(2)
+            .setRequired(true)
+        ),
+        new ActionRowBuilder().addComponents(
+          new TextInputBuilder()
+            .setCustomId('note')
+            .setLabel('Keterangan / Syarat (opsional)')
+            .setStyle(TextInputStyle.Paragraph)
+            .setMaxLength(300)
+            .setRequired(false)
+        )
+      );
+
+    return interaction.showModal(modal);
+  }
+
+  // Menu pilih giveaway yang mau diakhiri
+  if (interaction.customId === 'ry_gw_panel_end') {
+    const active = guildGiveaways(guildId, false);
+
+    if (!active.length) {
+      return interaction.reply({
+        content: 'Tidak ada giveaway yang sedang berjalan.',
+        ephemeral: true
+      });
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ry_gw_end_select')
+      .setPlaceholder('Pilih giveaway yang mau diakhiri...')
+      .addOptions(
+        active.map(gw => ({
+          label: gw.prize.slice(0, 100),
+          description:
+            `${gw.entries.length} peserta • ID ${gw.messageId}`.slice(0, 100),
+          value: gw.messageId
+        }))
+      );
+
+    return interaction.reply({
+      content: 'Pilih giveaway yang mau diakhiri sekarang:',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      ephemeral: true
+    });
+  }
+
+  // Menu pilih giveaway yang mau di-reroll
+  if (interaction.customId === 'ry_gw_panel_reroll') {
+    const finished = guildGiveaways(guildId, true).filter(
+      gw => gw.entries.length > 0
+    );
+
+    if (!finished.length) {
+      return interaction.reply({
+        content: 'Belum ada giveaway selesai yang bisa di-reroll.',
+        ephemeral: true
+      });
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('ry_gw_reroll_select')
+      .setPlaceholder('Pilih giveaway yang mau di-reroll...')
+      .addOptions(
+        finished.map(gw => ({
+          label: gw.prize.slice(0, 100),
+          description:
+            `${gw.entries.length} peserta • ID ${gw.messageId}`.slice(0, 100),
+          value: gw.messageId
+        }))
+      );
+
+    return interaction.reply({
+      content: 'Pilih giveaway yang mau dipilih ulang pemenangnya (1 pemenang baru):',
+      components: [new ActionRowBuilder().addComponents(menu)],
+      ephemeral: true
+    });
+  }
+
+  // Daftar giveaway aktif
+  if (interaction.customId === 'ry_gw_panel_list') {
+    const active = guildGiveaways(guildId, false);
+
+    if (!active.length) {
+      return interaction.reply({
+        content: 'Tidak ada giveaway yang sedang berjalan.',
+        ephemeral: true
+      });
+    }
+
+    const lines = active.map(gw =>
+      `• **${gw.prize}** — ${gw.entries.length} peserta — berakhir <t:${Math.floor(gw.endsAt / 1000)}:R> — [lihat](${giveawayLink(gw)})`
+    );
+
+    return interaction.reply({
+      content: lines.join('\n').slice(0, 1900),
+      ephemeral: true
+    });
+  }
+}
+
+// Form "Buat Giveaway" disubmit
+async function handleGiveawayModal(interaction) {
+  if (!isStaff(interaction.member)) {
+    return interaction.reply({
+      content: 'Hanya admin atau Staff yang bisa membuat giveaway.',
+      ephemeral: true
+    });
+  }
+
+  const guild = interaction.guild;
+  const cfg = guildConfig(guild.id);
+
+  const rundown = cfg.giveawayRundownChannelId
+    ? guild.channels.cache.get(cfg.giveawayRundownChannelId)
+    : null;
+
+  if (!rundown?.isTextBased()) {
+    return interaction.reply({
+      content: 'Channel rundown tidak ditemukan. Jalankan `ry!setup giveaway` dulu.',
+      ephemeral: true
+    });
+  }
+
+  const prize = interaction.fields
+    .getTextInputValue('prize')
+    .trim()
+    .slice(0, 100);
+
+  const duration = parseDuration(
+    interaction.fields
+      .getTextInputValue('duration')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '')
+  );
+
+  const winnerCount = Number(
+    interaction.fields.getTextInputValue('winners').trim()
+  );
+
+  const note = interaction.fields
+    .getTextInputValue('note')
+    .trim()
+    .slice(0, 300);
+
+  if (!prize) {
+    return interaction.reply({
+      content: 'Hadiah tidak boleh kosong.',
+      ephemeral: true
+    });
+  }
+
+  if (
+    !duration ||
+    duration < 10000 ||
+    duration > 30 * 86400000
+  ) {
+    return interaction.reply({
+      content:
+        'Durasi tidak valid. Contoh: `30m`, `2h`, `1d`, atau `1d12h` (minimal 10 detik, maksimal 30 hari).',
+      ephemeral: true
+    });
+  }
+
+  if (
+    !Number.isInteger(winnerCount) ||
+    winnerCount < 1 ||
+    winnerCount > 20
+  ) {
+    return interaction.reply({
+      content: 'Jumlah pemenang harus angka 1 sampai 20.',
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const gw = {
+    guildId: guild.id,
+    channelId: rundown.id,
+    messageId: null,
+    hostId: interaction.user.id,
+    prize,
+    note,
+    winners: winnerCount,
+    endsAt: Date.now() + duration,
+    createdAt: Date.now(),
+    entries: [],
+    winnerIds: [],
+    ended: false
+  };
+
+  const sent = await rundown.send({
+    embeds: [buildGiveawayEmbed(gw)],
+    components: giveawayComponents(gw)
+  });
+
+  gw.messageId = sent.id;
+  giveaways[sent.id] = gw;
+  saveGiveaways();
+
+  // Update sekali lagi biar ID pesan muncul di footer
+  await sent.edit({
+    embeds: [buildGiveawayEmbed(gw)]
+  }).catch(() => {});
+
+  return interaction.editReply({
+    content: `✅ Giveaway **${prize}** sudah tayang di ${rundown}: ${sent.url}`
+  });
+}
+
+// Menu "Akhiri giveaway"
+async function handleGiveawayEndSelect(interaction) {
+  if (!isStaff(interaction.member)) {
+    return interaction.reply({
+      content: 'Hanya admin atau Staff.',
+      ephemeral: true
+    });
+  }
+
+  const gw = giveaways[interaction.values[0]];
+
+  await interaction.deferUpdate();
+
+  if (!gw || gw.guildId !== interaction.guild.id || gw.ended) {
+    return interaction.editReply({
+      content: 'Giveaway itu sudah berakhir atau tidak ditemukan.',
+      components: []
+    });
+  }
+
+  gw.endsAt = Date.now();
+  await endGiveaway(gw);
+
+  return interaction.editReply({
+    content: `⏹️ Giveaway **${gw.prize}** sudah diakhiri.`,
+    components: []
+  });
+}
+
+// Menu "Reroll giveaway"
+async function handleGiveawayRerollSelect(interaction) {
+  if (!isStaff(interaction.member)) {
+    return interaction.reply({
+      content: 'Hanya admin atau Staff.',
+      ephemeral: true
+    });
+  }
+
+  const gw = giveaways[interaction.values[0]];
+
+  await interaction.deferUpdate();
+
+  if (
+    !gw ||
+    gw.guildId !== interaction.guild.id ||
+    !gw.ended
+  ) {
+    return interaction.editReply({
+      content: 'Giveaway itu tidak ditemukan.',
+      components: []
+    });
+  }
+
+  const picked = await rerollGiveaway(gw, 1);
+
+  return interaction.editReply({
+    content: picked
+      ? `🔄 Pemenang baru untuk **${gw.prize}**: <@${picked[0]}>`
+      : 'Tidak ada peserta lain yang bisa dipilih untuk reroll.',
+    components: []
+  });
+}
+
+function checkGiveaways() {
+  const now = Date.now();
+
+  for (const gw of Object.values(giveaways)) {
+    if (!gw.ended && gw.endsAt <= now) {
+      endGiveaway(gw).catch(console.error);
+    }
+  }
+}
+
+async function handleGiveawayJoin(interaction) {
+  const gw = giveaways[interaction.message.id];
+
+  if (!gw || gw.ended || Date.now() >= gw.endsAt) {
+    return interaction.reply({
+      content: '⏰ Giveaway ini sudah berakhir.',
+      ephemeral: true
+    });
+  }
+
+  if (gw.entries.includes(interaction.user.id)) {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ry_gw_leave:${gw.messageId}`)
+        .setLabel('Keluar dari Giveaway')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    return interaction.reply({
+      content: '✅ Kamu sudah terdaftar di giveaway ini.',
+      components: [row],
+      ephemeral: true
+    });
+  }
+
+  gw.entries.push(interaction.user.id);
+  saveGiveaways();
+  scheduleGiveawayRefresh(gw);
+
+  return interaction.reply({
+    content:
+      `🎉 Kamu berhasil ikut giveaway **${gw.prize}**!\n` +
+      `Total peserta: **${gw.entries.length}**. Semoga beruntung!`,
+    ephemeral: true
+  });
+}
+
+async function handleGiveawayLeave(interaction) {
+  const id = interaction.customId.split(':')[1];
+  const gw = giveaways[id];
+
+  if (!gw || gw.ended) {
+    return interaction.update({
+      content: '⏰ Giveaway ini sudah berakhir.',
+      components: []
+    });
+  }
+
+  gw.entries = gw.entries.filter(
+    userId => userId !== interaction.user.id
+  );
+
+  saveGiveaways();
+  scheduleGiveawayRefresh(gw);
+
+  return interaction.update({
+    content: '👋 Kamu sudah keluar dari giveaway.',
+    components: []
+  });
 }
 
 // ===============================
@@ -903,6 +1863,10 @@ client.once('ready', () => {
     );
   }
 
+  // Cek giveaway yang udah waktunya berakhir (tahan restart bot)
+  checkGiveaways();
+  setInterval(checkGiveaways, 10000);
+
   client.user.setPresence({
     activities: [{ name: 'ry!help | RY Support' }],
     status: 'online'
@@ -972,6 +1936,7 @@ client.on('messageCreate', async message => {
         '`ry!setup welcome` — setup welcome',
         '`ry!setup ticket` — setup ticket',
         '`ry!setup vouches` — setup vouches',
+        '`ry!setup giveaway` — setup giveaway (rundown, history, setting)',
         '`ry!welcome test` — tes audio welcome.mp3',
         '`ry!vouches <gambar> @buyer <produk> <harga> <done/pending>`',
         '`ry!ticket close` — tutup ticket'
@@ -1015,6 +1980,14 @@ client.on('messageCreate', async message => {
         );
       }
 
+      if (target === 'giveaway') {
+        const result = await setupGiveaway(message.guild);
+
+        return message.reply(
+          `Giveaway siap! Rundown: ${result.rundown}. History: ${result.history}. Panel kontrol (khusus Staff): ${result.setting}.`
+        );
+      }
+
       if (target === 'all') {
         const result = await setupAll(message.guild);
 
@@ -1023,13 +1996,14 @@ client.on('messageCreate', async message => {
           `Welcome: ${result.welcome.voice}\n` +
           `Ticket: ${result.ticket.panel}\n` +
           `Logs: ${result.ticket.logs}\n` +
-          `Vouches: ${result.vouches}\n\n` +
+          `Vouches: ${result.vouches}\n` +
+          `Giveaway: ${result.giveaway.setting}\n\n` +
           `Atur permission channel member agar role Verified mendapat akses.`
         );
       }
 
       return message.reply(
-        'Gunakan ry!setup all, welcome, ticket, atau vouches.'
+        'Gunakan ry!setup all, welcome, ticket, vouches, atau giveaway.'
       );
     } catch (error) {
       console.error(error);
@@ -1217,7 +2191,45 @@ client.on('interactionCreate', async interaction => {
       return;
     }
 
+    if (
+      interaction.isModalSubmit() &&
+      interaction.customId === 'ry_gw_modal_create'
+    ) {
+      await handleGiveawayModal(interaction);
+      return;
+    }
+
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === 'ry_gw_end_select'
+    ) {
+      await handleGiveawayEndSelect(interaction);
+      return;
+    }
+
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === 'ry_gw_reroll_select'
+    ) {
+      await handleGiveawayRerollSelect(interaction);
+      return;
+    }
+
     if (!interaction.isButton()) return;
+
+    // GIVEAWAY: PANEL SETTING (STAFF)
+    if (interaction.customId.startsWith('ry_gw_panel_')) {
+      return handleGiveawayPanel(interaction);
+    }
+
+    // GIVEAWAY: IKUT / KELUAR
+    if (interaction.customId === 'ry_gw_join') {
+      return handleGiveawayJoin(interaction);
+    }
+
+    if (interaction.customId.startsWith('ry_gw_leave:')) {
+      return handleGiveawayLeave(interaction);
+    }
 
     // CLAIM TICKET
     if (interaction.customId === 'ry_ticket_claim') {
