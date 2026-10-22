@@ -3,7 +3,7 @@ require('dotenv').config();
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const { randomInt } = require('node:crypto');
+const { randomInt, randomBytes } = require('node:crypto');
 
 const {
   Client,
@@ -41,6 +41,31 @@ const VERIFIED_ROLE_NAME =
 const STAFF_ROLE_NAME =
   process.env.STAFF_ROLE_NAME || 'Staff';
 
+// ID role dari .env. Kalau diisi, bot SELALU pakai role ini dan nggak pernah
+// bikin role baru. Cara ambil: aktifkan Developer Mode di Discord, klik kanan
+// role -> Copy Role ID.
+function envRoleId(name) {
+  const value = (process.env[name] || '').trim();
+
+  if (!value) return '';
+
+  if (!/^\d{17,20}$/.test(value)) {
+    console.warn(
+      `PERINGATAN: ${name} di .env bukan ID role yang valid, diabaikan.`
+    );
+
+    return '';
+  }
+
+  return value;
+}
+
+const VERIFIED_ROLE_ID = envRoleId('VERIFIED_ROLE_ID');
+const STAFF_ROLE_ID = envRoleId('STAFF_ROLE_ID');
+
+// Error yang pesannya aman ditampilkan ke user di Discord
+class SetupError extends Error {}
+
 // Lokasi file mp3 welcome (opsional, bisa relatif ke folder ROOT atau absolut).
 // Kalau kosong, bot otomatis nyari welcome.mp3 di beberapa lokasi umum.
 const WELCOME_AUDIO_PATH = process.env.WELCOME_AUDIO_PATH || '';
@@ -71,8 +96,17 @@ const client = new Client({
   ]
 });
 
+// ROOT dipakai buat nyari welcome.mp3. Data bot (config.json, dll) disimpan
+// di DATA_DIR: default-nya folder project ini, atau isi DATA_DIR di .env
+// kalau hosting kamu punya folder khusus yang permanen.
 const ROOT = path.resolve(__dirname, '..');
-const CONFIG_PATH = path.join(ROOT, 'config.json');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : __dirname;
+
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const CONFIG_PATH = path.join(DATA_DIR, 'config.json');
 
 let config = { guilds: {} };
 
@@ -94,7 +128,7 @@ const ticketCreateLocks = new Set();
 // DATA GIVEAWAY
 // ===============================
 
-const GIVEAWAYS_PATH = path.join(ROOT, 'giveaways.json');
+const GIVEAWAYS_PATH = path.join(DATA_DIR, 'giveaways.json');
 const GIVEAWAY_KEEP_DAYS = 30;
 
 let giveaways = {};
@@ -155,6 +189,9 @@ function isStaff(member) {
     ) ||
     // Cek lewat ID role (aman walau role di-rename)
     Boolean(
+      STAFF_ROLE_ID && member.roles.cache.has(STAFF_ROLE_ID)
+    ) ||
+    Boolean(
       cfg.staffRoleId &&
       member.roles.cache.has(cfg.staffRoleId)
     ) ||
@@ -198,12 +235,108 @@ async function findOrCreateRole(guild, name, options = {}) {
   return role;
 }
 
-async function findOrCreateCategory(guild, name) {
-  let category = guild.channels.cache.find(
-    channel =>
-      channel.type === ChannelType.GuildCategory &&
-      channel.name === name
+// Cari role dengan urutan:
+// 1. role yang dipilih langsung di command (override)
+// 2. ID yang tersimpan di config.json
+// 3. ID dari .env (cadangan kalau config.json hilang)
+// 4. role dengan nama yang cocok
+// Role baru HANYA dibuat kalau createRoles = true (setup pertama),
+// dan nggak pernah dibuat oleh /resetup.
+async function resolveRole(guild, {
+  label,
+  envName,
+  envId,
+  configId,
+  name,
+  color,
+  hint = `Isi ${envName}=<ID role> di file .env.`,
+  override = null,
+  createRoles
+}) {
+  if (override) return override;
+
+  const configured = configId && guild.roles.cache.get(configId);
+
+  if (configured) return configured;
+
+  if (envId) {
+    const role = guild.roles.cache.get(envId);
+
+    if (!role) {
+      throw new SetupError(
+        `Role ${label} dengan ID \`${envId}\` (dari ${envName} di .env) tidak ditemukan di server ini. Cek lagi ID-nya.`
+      );
+    }
+
+    return role;
+  }
+
+  const byName = guild.roles.cache.find(role => role.name === name);
+
+  if (byName) return byName;
+
+  if (!createRoles) {
+    throw new SetupError(`Role ${label} belum ditemukan. ${hint}`);
+  }
+
+  return guild.roles.create({
+    name,
+    color,
+    reason: 'Setup bot RY'
+  });
+}
+
+async function getVerifiedRole(
+  guild,
+  { createRoles = true, verifiedRole = null } = {}
+) {
+  const cfg = guildConfig(guild.id);
+
+  return resolveRole(guild, {
+    label: 'Verified',
+    envName: 'VERIFIED_ROLE_ID',
+    envId: VERIFIED_ROLE_ID,
+    configId: cfg.verifiedRoleId,
+    name: VERIFIED_ROLE_NAME,
+    color: 0x57f287,
+    hint: 'Pilih rolenya lewat `/setup welcome role:` atau `/resetup role:` (atau isi VERIFIED_ROLE_ID di .env).',
+    override: verifiedRole,
+    createRoles
+  });
+}
+
+// Versi cepat (tanpa bikin role) buat dipakai saat bot jalan
+function currentVerifiedRole(guild) {
+  const cfg = guildConfig(guild.id);
+
+  return (
+    (cfg.verifiedRoleId && guild.roles.cache.get(cfg.verifiedRoleId)) ||
+    (VERIFIED_ROLE_ID && guild.roles.cache.get(VERIFIED_ROLE_ID)) ||
+    null
   );
+}
+
+function currentStaffRole(guild) {
+  const cfg = guildConfig(guild.id);
+
+  return (
+    (cfg.staffRoleId && guild.roles.cache.get(cfg.staffRoleId)) ||
+    (STAFF_ROLE_ID && guild.roles.cache.get(STAFF_ROLE_ID)) ||
+    null
+  );
+}
+
+async function findOrCreateCategory(guild, name, knownId = null) {
+  let category =
+    (knownId &&
+      guild.channels.cache.get(knownId)?.type === ChannelType.GuildCategory
+      ? guild.channels.cache.get(knownId)
+      : null) ||
+    guild.channels.cache.find(
+      channel =>
+        channel.type === ChannelType.GuildCategory &&
+        channel.name === name
+    );
 
   if (!category) {
     category = await guild.channels.create({
@@ -222,15 +355,23 @@ async function findOrCreateChannel(
   type,
   options = {}
 ) {
-  let channel = guild.channels.cache.find(
-    item => item.name === name && item.type === type
-  );
+  // knownId: ID channel yang sudah tersimpan, dicari duluan (aman walau
+  // nama channel sudah diganti). Kalau nggak ketemu baru cari lewat nama.
+  const { knownId, ...createOptions } = options;
+
+  const byId = knownId ? guild.channels.cache.get(knownId) : null;
+
+  let channel =
+    (byId && byId.type === type ? byId : null) ||
+    guild.channels.cache.find(
+      item => item.name === name && item.type === type
+    );
 
   if (!channel) {
     channel = await guild.channels.create({
       name,
       type,
-      ...options,
+      ...createOptions,
       reason: 'Setup bot RY'
     });
   }
@@ -242,25 +383,32 @@ async function findOrCreateChannel(
 // SETUP WELCOME
 // ===============================
 
-async function setupWelcome(guild) {
+async function setupWelcome(guild, opts = {}) {
   const cfg = guildConfig(guild.id);
 
-  const verifiedRole = await findOrCreateRole(
-    guild,
-    VERIFIED_ROLE_NAME,
-    { color: 0x57f287 }
-  );
+  const verifiedRole = await getVerifiedRole(guild, opts);
+
+  // Pastikan bot memang bisa ngasih role ini (posisi role, izin, dll)
+  // sebelum bikin channel apa pun
+  const roleProblem = checkRoleAssignable(guild, verifiedRole);
+
+  if (roleProblem) {
+    throw new SetupError(
+      `Role Verified (**${verifiedRole.name}**): ${roleProblem}`
+    );
+  }
 
   const category = await findOrCreateCategory(
     guild,
-    '・ー ✧ Introduction ✧ ー・'
+    '・ー ✧ Introduction ✧ ー・',
+    cfg.welcomeCategoryId
   );
 
   const voice = await findOrCreateChannel(
     guild,
     '🔊・welcome',
     ChannelType.GuildVoice,
-    { parent: category.id }
+    { knownId: cfg.welcomeVoiceChannelId, parent: category.id }
   );
 
   cfg.verifiedRoleId = verifiedRole.id;
@@ -270,106 +418,6 @@ async function setupWelcome(guild) {
   saveConfig();
 
   return { verifiedRole, category, voice };
-}
-
-// ===============================
-// SETUP TICKET
-// ===============================
-
-async function setupTicket(guild) {
-  const cfg = guildConfig(guild.id);
-
-  const staffRole = await findOrCreateRole(
-    guild,
-    STAFF_ROLE_NAME,
-    { color: 0x5865f2 }
-  );
-
-  const category = await findOrCreateCategory(
-    guild,
-    '・ー ✧ Ticket ✧ ー・'
-  );
-
-  const panel = await findOrCreateChannel(
-    guild,
-    '🎫・open-ticket',
-    ChannelType.GuildText,
-    {
-      parent: category.id,
-      topic: 'Panel untuk membuka ticket.'
-    }
-  );
-
-  const logs = await findOrCreateChannel(
-    guild,
-    '📑・ticket-logs',
-    ChannelType.GuildText,
-    {
-      parent: category.id,
-      topic: 'Log transcript ticket.'
-    }
-  );
-
-  cfg.staffRoleId = staffRole.id;
-  cfg.ticketCategoryId = category.id;
-  cfg.ticketPanelChannelId = panel.id;
-  cfg.ticketLogsChannelId = logs.id;
-
-  saveConfig();
-
-  const recent = await panel.messages.fetch({
-    limit: 20
-  }).catch(() => null);
-
-  const exists = recent?.some(message =>
-    message.author.id === client.user.id &&
-    message.components.some(row =>
-      row.components.some(
-        component =>
-          component.customId === 'ry_ticket_category'
-      )
-    )
-  );
-
-  if (!exists) {
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle('🎫 Ticket Support')
-      .setDescription(
-        'Pilih kategori untuk membuka ticket privat.'
-      )
-      .setFooter({ text: 'RY Support System' });
-
-    const select = new StringSelectMenuBuilder()
-      .setCustomId('ry_ticket_category')
-      .setPlaceholder('Pilih kategori ticket...')
-      .addOptions(
-        {
-          label: 'Pembelian / Order',
-          value: 'order',
-          emoji: '🛒'
-        },
-        {
-          label: 'Bantuan',
-          value: 'support',
-          emoji: '🛟'
-        },
-        {
-          label: 'Lainnya',
-          value: 'other',
-          emoji: '💬'
-        }
-      );
-
-    await panel.send({
-      embeds: [embed],
-      components: [
-        new ActionRowBuilder().addComponents(select)
-      ]
-    });
-  }
-
-  return { staffRole, category, panel, logs };
 }
 
 // ===============================
@@ -384,6 +432,7 @@ async function setupVouches(guild) {
     '💸・vouches',
     ChannelType.GuildText,
     {
+      knownId: cfg.vouchesChannelId,
       topic: 'Bukti transaksi dan testimoni pembeli.'
     }
   );
@@ -398,21 +447,15 @@ async function setupVouches(guild) {
 // SETUP GIVEAWAY
 // ===============================
 
-async function setupGiveaway(guild) {
+async function setupGiveaway(guild, opts = {}) {
   const cfg = guildConfig(guild.id);
 
-  // Pakai role Staff yang udah ada (lewat ID), jangan bikin dobel
-  const staffRole =
-    (cfg.staffRoleId && guild.roles.cache.get(cfg.staffRoleId)) ||
-    await findOrCreateRole(guild, STAFF_ROLE_NAME, {
-      color: 0x5865f2
-    });
-
-  cfg.staffRoleId = staffRole.id;
+  const staffRole = await getStaffRole(guild, opts);
 
   const category = await findOrCreateCategory(
     guild,
-    '・ー ✧ Give Away ✧ ー・'
+    '・ー ✧ Give Away ✧ ー・',
+    cfg.giveawayCategoryId
   );
 
   const botPermissions = {
@@ -443,9 +486,10 @@ async function setupGiveaway(guild) {
 
   const rundown = await findOrCreateChannel(
     guild,
-    '╭⋅🎁┊giveaway',
+    '🎁・giveaway-rundown',
     ChannelType.GuildText,
     {
+      knownId: cfg.giveawayRundownChannelId,
       parent: category.id,
       topic: 'Giveaway yang sedang berlangsung. Klik tombol untuk ikut!',
       permissionOverwrites: readOnly
@@ -454,9 +498,10 @@ async function setupGiveaway(guild) {
 
   const history = await findOrCreateChannel(
     guild,
-    '┣⋅📜┊giveaway-history',
+    '📜・giveaway-history',
     ChannelType.GuildText,
     {
+      knownId: cfg.giveawayHistoryChannelId,
       parent: category.id,
       topic: 'Riwayat giveaway yang sudah selesai.',
       permissionOverwrites: readOnly
@@ -466,9 +511,10 @@ async function setupGiveaway(guild) {
   // Setting: khusus admin & Staff
   const setting = await findOrCreateChannel(
     guild,
-    '╰⋅⚙️┊giveaway-setting',
+    '🔧・giveaway-setting',
     ChannelType.GuildText,
     {
+      knownId: cfg.giveawaySettingChannelId,
       parent: category.id,
       topic: 'Panel khusus Staff untuk mengelola giveaway.',
       permissionOverwrites: [
@@ -562,15 +608,19 @@ async function setupGiveaway(guild) {
 // SETUP HOOK & REACTION ROLE
 // ===============================
 
-async function getStaffRole(guild) {
+async function getStaffRole(guild, { createRoles = true } = {}) {
   const cfg = guildConfig(guild.id);
 
-  // Pakai role Staff yang udah ada (lewat ID), jangan bikin dobel
-  const role =
-    (cfg.staffRoleId && guild.roles.cache.get(cfg.staffRoleId)) ||
-    await findOrCreateRole(guild, STAFF_ROLE_NAME, {
-      color: 0x5865f2
-    });
+  const role = await resolveRole(guild, {
+    label: 'Staff',
+    envName: 'STAFF_ROLE_ID',
+    envId: STAFF_ROLE_ID,
+    configId: cfg.staffRoleId,
+    name: STAFF_ROLE_NAME,
+    color: 0x5865f2,
+    hint: 'Isi STAFF_ROLE_ID=<ID role> di file .env, atau buat role bernama "Staff", lalu jalankan /resetup lagi.',
+    createRoles
+  });
 
   cfg.staffRoleId = role.id;
 
@@ -707,14 +757,15 @@ function rrPanelComponents() {
   ];
 }
 
-async function setupHook(guild) {
+async function setupHook(guild, opts = {}) {
   const cfg = guildConfig(guild.id);
 
-  const staffRole = await getStaffRole(guild);
+  const staffRole = await getStaffRole(guild, opts);
 
   const category = await findOrCreateCategory(
     guild,
-    '・ー ✧ Tools ✧ ー・'
+    '・ー ✧ Tools ✧ ー・',
+    cfg.toolsCategoryId
   );
 
   const panel = await findOrCreateChannel(
@@ -722,6 +773,7 @@ async function setupHook(guild) {
     '🪝・hook-setting',
     ChannelType.GuildText,
     {
+      knownId: cfg.hookPanelChannelId,
       parent: category.id,
       topic: 'Panel khusus Staff untuk membuat dan mengirim pesan embed.',
       permissionOverwrites: staffOnlyOverwrites(guild, staffRole)
@@ -755,14 +807,15 @@ async function setupHook(guild) {
   return { staffRole, category, panel };
 }
 
-async function setupReactionRole(guild) {
+async function setupReactionRole(guild, opts = {}) {
   const cfg = guildConfig(guild.id);
 
-  const staffRole = await getStaffRole(guild);
+  const staffRole = await getStaffRole(guild, opts);
 
   const category = await findOrCreateCategory(
     guild,
-    '・ー ✧ Tools ✧ ー・'
+    '・ー ✧ Tools ✧ ー・',
+    cfg.toolsCategoryId
   );
 
   const panel = await findOrCreateChannel(
@@ -770,6 +823,7 @@ async function setupReactionRole(guild) {
     '🎭・reactionrole-setting',
     ChannelType.GuildText,
     {
+      knownId: cfg.reactionRolePanelChannelId,
       parent: category.id,
       topic: 'Panel khusus Staff untuk mengatur reaction role.',
       permissionOverwrites: staffOnlyOverwrites(guild, staffRole)
@@ -802,17 +856,6 @@ async function setupReactionRole(guild) {
   }
 
   return { staffRole, category, panel };
-}
-
-async function setupAll(guild) {
-  const welcome = await setupWelcome(guild);
-  const ticket = await setupTicket(guild);
-  const vouches = await setupVouches(guild);
-  const giveaway = await setupGiveaway(guild);
-  const hook = await setupHook(guild);
-  const reactionRole = await setupReactionRole(guild);
-
-  return { welcome, ticket, vouches, giveaway, hook, reactionRole };
 }
 
 // ===============================
@@ -970,9 +1013,7 @@ async function processWelcomeQueue(guild) {
         continue;
       }
 
-      const verifiedRole = guild.roles.cache.get(
-        cfg.verifiedRoleId
-      );
+      const verifiedRole = currentVerifiedRole(guild);
 
       if (!verifiedRole) continue;
 
@@ -1843,13 +1884,7 @@ async function sendTicketTranscript(channel, closedBy) {
 }
 
 async function closeTicket(channel, closedBy) {
-  const cfg = guildConfig(channel.guild.id);
-
-  const logs = cfg.ticketLogsChannelId
-    ? channel.guild.channels.cache.get(
-        cfg.ticketLogsChannelId
-      )
-    : null;
+  const logs = ticketLogsChannel(channel);
 
   const transcript = await sendTicketTranscript(
     channel,
@@ -1899,153 +1934,6 @@ async function closeTicket(channel, closedBy) {
 }
 
 // ===============================
-// MEMBUAT TICKET PRIVAT
-// ===============================
-
-async function createTicket(interaction, categoryKey) {
-  const guild = interaction.guild;
-  const member = interaction.member;
-  const cfg = guildConfig(guild.id);
-
-  const category = guild.channels.cache.get(
-    cfg.ticketCategoryId
-  );
-
-  const staffRole = guild.roles.cache.get(
-    cfg.staffRoleId
-  );
-
-  if (!category || !staffRole) {
-    return interaction.reply({
-      content: 'Jalankan /setup ticket terlebih dahulu.',
-      ephemeral: true
-    });
-  }
-
-  const lockKey = `${guild.id}:${member.id}`;
-
-  if (ticketCreateLocks.has(lockKey)) {
-    return interaction.reply({
-      content: 'Ticket sedang diproses.',
-      ephemeral: true
-    });
-  }
-
-  ticketCreateLocks.add(lockKey);
-
-  try {
-    const existing = guild.channels.cache.find(
-      channel =>
-        channel.parentId === category.id &&
-        channel.topic?.includes(`ticket-owner:${member.id}`)
-    );
-
-    if (existing) {
-      return interaction.reply({
-        content: `Kamu masih punya ticket terbuka: ${existing}`,
-        ephemeral: true
-      });
-    }
-
-    const labels = {
-      order: 'order',
-      support: 'bantuan',
-      other: 'lainnya'
-    };
-
-    const label = labels[categoryKey] || 'bantuan';
-
-    const ticketChannel = await guild.channels.create({
-      name: `ticket-${label}-${member.user.username}`
-        .toLowerCase()
-        .replace(/[^a-z0-9-]/g, '-')
-        .slice(0, 90),
-
-      type: ChannelType.GuildText,
-      parent: category.id,
-      topic: `ticket-owner:${member.id}; kategori:${label}`,
-
-      permissionOverwrites: [
-        {
-          id: guild.roles.everyone.id,
-          deny: [PermissionFlagsBits.ViewChannel]
-        },
-        {
-          id: member.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles
-          ]
-        },
-        {
-          id: staffRole.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.ManageMessages
-          ]
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionFlagsBits.ViewChannel,
-            PermissionFlagsBits.SendMessages,
-            PermissionFlagsBits.ReadMessageHistory,
-            PermissionFlagsBits.AttachFiles,
-            PermissionFlagsBits.ManageChannels
-          ]
-        }
-      ]
-    });
-
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle('Ticket dibuat')
-      .setDescription(
-        `Halo ${member}, staff akan membantu kamu. Jelaskan kebutuhanmu di sini.`
-      )
-      .addFields({
-        name: 'Kategori',
-        value: label
-      })
-      .setTimestamp();
-
-    const buttons = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('ry_ticket_claim')
-        .setLabel('Claim Ticket')
-        .setStyle(ButtonStyle.Primary),
-
-      new ButtonBuilder()
-        .setCustomId('ry_ticket_close')
-        .setLabel('Tutup Ticket')
-        .setStyle(ButtonStyle.Danger)
-    );
-
-    await ticketChannel.send({
-      content: `${member} <@&${staffRole.id}>`,
-      embeds: [embed],
-      components: [buttons],
-      allowedMentions: {
-        users: [member.id],
-        roles: [staffRole.id]
-      }
-    });
-
-    await interaction.reply({
-      content: `Ticket berhasil dibuat: ${ticketChannel}`,
-      ephemeral: true
-    });
-  } finally {
-    ticketCreateLocks.delete(lockKey);
-  }
-}
-
-// ===============================
 // SLASH COMMANDS
 // ===============================
 
@@ -2057,7 +1945,7 @@ function buildSlashCommands() {
   const targets = [
     ['all', 'Setup semua sistem sekaligus'],
     ['welcome', 'Voice welcome + role Verified'],
-    ['ticket', 'Panel ticket support'],
+    ['ticket', 'Panel pengaturan ticket (kategori, teks, pilihan)'],
     ['vouches', 'Channel vouches'],
     ['giveaway', 'Kategori giveaway (rundown, history, setting)'],
     ['hook', 'Panel pembuat embed ala Discohook'],
@@ -2065,9 +1953,20 @@ function buildSlashCommands() {
   ];
 
   for (const [name, description] of targets) {
-    setup.addSubcommand(sub =>
-      sub.setName(name).setDescription(description)
-    );
+    setup.addSubcommand(sub => {
+      sub.setName(name).setDescription(description);
+
+      // Role Verified bisa dipilih langsung dari command
+      if (name === 'welcome' || name === 'all') {
+        sub.addRoleOption(option =>
+          option
+            .setName('role')
+            .setDescription('Role Verified yang dikasih setelah audio welcome selesai (opsional)')
+        );
+      }
+
+      return sub;
+    });
   }
 
   return [
@@ -2076,6 +1975,29 @@ function buildSlashCommands() {
       .setDescription('Daftar command RY Bot'),
 
     setup,
+
+    new SlashCommandBuilder()
+      .setName('resetup')
+      .setDescription('Sambungkan ulang sistem yang sudah di-setup (yang belum di-setup dilewati)')
+      .addStringOption(option =>
+        option
+          .setName('sistem')
+          .setDescription('Sistem yang disambungkan ulang (default: semua)')
+          .addChoices(
+            { name: 'Semua sistem', value: 'all' },
+            { name: 'Welcome', value: 'welcome' },
+            { name: 'Ticket', value: 'ticket' },
+            { name: 'Vouches', value: 'vouches' },
+            { name: 'Giveaway', value: 'giveaway' },
+            { name: 'Hook', value: 'hook' },
+            { name: 'Reaction Role', value: 'reactionrole' }
+          )
+      )
+      .addRoleOption(option =>
+        option
+          .setName('role')
+          .setDescription('Role Verified untuk sistem Welcome (opsional)')
+      ),
 
     new SlashCommandBuilder()
       .setName('welcome')
@@ -2153,6 +2075,95 @@ async function registerSlashCommands(guild) {
   }
 }
 
+function channelExists(guild, id, name) {
+  return Boolean(
+    (id && guild.channels.cache.has(id)) ||
+    guild.channels.cache.some(channel => channel.name === name)
+  );
+}
+
+// [kunci, label, fungsi setup, fungsi cek "sudah pernah di-setup?"]
+const SETUP_SYSTEMS = [
+  ['welcome', 'Welcome', async (guild, opts) => {
+    const r = await setupWelcome(guild, opts);
+
+    return `Voice: ${r.voice} • Role: ${r.verifiedRole.name}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).welcomeVoiceChannelId, '🔊・welcome'
+  )],
+  ['ticket', 'Ticket', async (guild, opts) => {
+    const r = await setupTicket(guild, opts);
+
+    return `Panel Staff: ${r.panel}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).ticketSettingChannelId, '🎫・ticket-setting'
+  )],
+  ['vouches', 'Vouches', async guild => {
+    const channel = await setupVouches(guild);
+
+    return `Channel: ${channel}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).vouchesChannelId, '💸・vouches'
+  )],
+  ['giveaway', 'Giveaway', async (guild, opts) => {
+    const r = await setupGiveaway(guild, opts);
+
+    return `Rundown: ${r.rundown} • History: ${r.history} • Panel Staff: ${r.setting}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).giveawayRundownChannelId, '🎁・giveaway-rundown'
+  )],
+  ['hook', 'Hook', async (guild, opts) => {
+    const r = await setupHook(guild, opts);
+
+    return `Panel Staff: ${r.panel}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).hookPanelChannelId, '🪝・hook-setting'
+  )],
+  ['reactionrole', 'Reaction Role', async (guild, opts) => {
+    const r = await setupReactionRole(guild, opts);
+
+    return `Panel Staff: ${r.panel}`;
+  }, guild => channelExists(
+    guild, guildConfig(guild.id).reactionRolePanelChannelId, '🎭・reactionrole-setting'
+  )]
+];
+
+// Jalanin setup per sistem. Satu sistem gagal nggak bikin yang lain berhenti.
+// onlyExisting (dipakai /resetup): sistem yang belum pernah di-setup dilewati.
+async function runSetup(guild, target, opts = {}) {
+  const systems = target === 'all'
+    ? SETUP_SYSTEMS
+    : SETUP_SYSTEMS.filter(([key]) => key === target);
+
+  const lines = [];
+
+  for (const [key, label, run, isSetUp] of systems) {
+    if (opts.onlyExisting && !isSetUp(guild)) {
+      lines.push(
+        `⏭️ **${label}** — dilewati, belum pernah di-setup (pakai \`/setup ${key}\`).`
+      );
+
+      continue;
+    }
+
+    try {
+      lines.push(`✅ **${label}** — ${await run(guild, opts)}`);
+    } catch (error) {
+      if (error instanceof SetupError) {
+        lines.push(`❌ **${label}** — ${error.message}`);
+      } else {
+        console.error(`Setup ${label} gagal:`, error);
+
+        lines.push(
+          `❌ **${label}** — gagal, periksa izin bot dan console VPS.`
+        );
+      }
+    }
+  }
+
+  return lines.join('\n');
+}
+
 async function handleSlashCommand(interaction) {
   if (!interaction.guild) {
     return interaction.reply({
@@ -2170,12 +2181,13 @@ async function handleSlashCommand(interaction) {
       .setTitle('RY Bot Commands')
       .setDescription([
         '`/setup all` — setup semua sistem',
-        '`/setup welcome` — voice welcome + role Verified',
-        '`/setup ticket` — panel ticket',
+        '`/setup welcome role:@Role` — voice welcome + role Verified (role dipilih dari daftar)',
+        '`/setup ticket` — panel pengaturan ticket (kategori, teks, pilihan)',
         '`/setup vouches` — channel vouches',
         '`/setup giveaway` — rundown, history, dan panel giveaway',
         '`/setup hook` — panel pembuat embed (ala Discohook)',
         '`/setup reactionrole` — panel reaction role',
+        '`/resetup` — sambungkan ulang sistem yang sudah di-setup (yang belum dilewati)',
         '`/welcome test` — tes audio welcome.mp3',
         '`/vouches` — catat vouches transaksi',
         '`/ticket close` — tutup ticket'
@@ -2184,94 +2196,53 @@ async function handleSlashCommand(interaction) {
     return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  // SETUP
-  if (name === 'setup') {
+  // SETUP & RESETUP
+  if (name === 'setup' || name === 'resetup') {
     if (!isStaff(interaction.member)) {
       return interaction.reply({
-        content: 'Command setup hanya untuk admin atau Staff.',
+        content: 'Command ini hanya untuk admin atau Staff.',
         ephemeral: true
       });
     }
 
-    const target = interaction.options.getSubcommand();
+    const isResetup = name === 'resetup';
+
+    const target = isResetup
+      ? interaction.options.getString('sistem') || 'all'
+      : interaction.options.getSubcommand();
+
+    // Role Verified yang dipilih langsung di command (opsional)
+    const pickedRole = interaction.options.getRole('role');
+
+    const verifiedRole = pickedRole
+      ? interaction.guild.roles.cache.get(pickedRole.id) || null
+      : null;
+
+    if (pickedRole && !verifiedRole) {
+      return interaction.reply({
+        content: 'Role yang dipilih tidak ditemukan di server ini.',
+        ephemeral: true
+      });
+    }
 
     await interaction.deferReply({ ephemeral: true });
 
-    try {
-      const guild = interaction.guild;
+    // /resetup nggak pernah bikin role baru
+    const report = await runSetup(interaction.guild, target, {
+      createRoles: !isResetup,
+      verifiedRole,
+      onlyExisting: isResetup
+    });
 
-      if (target === 'welcome') {
-        const result = await setupWelcome(guild);
+    const header = isResetup
+      ? '♻️ **Resetup** — menyambungkan ulang sistem yang sudah pernah di-setup. Sistem yang belum di-setup dilewati, dan role baru tidak dibuat.'
+      : '🛠️ **Setup**';
 
-        return interaction.editReply(
-          `Welcome siap! Voice channel: ${result.voice}. Role: ${result.verifiedRole.name}.`
-        );
-      }
+    const footer = target === 'all' && !isResetup
+      ? '\n\nAtur permission channel member agar role Verified mendapat akses.'
+      : '';
 
-      if (target === 'ticket') {
-        const result = await setupTicket(guild);
-
-        return interaction.editReply(
-          `Ticket siap! Panel: ${result.panel}. Log: ${result.logs}. Tambahkan staff ke role ${result.staffRole.name}.`
-        );
-      }
-
-      if (target === 'vouches') {
-        const channel = await setupVouches(guild);
-
-        return interaction.editReply(
-          `Channel vouches siap: ${channel}`
-        );
-      }
-
-      if (target === 'giveaway') {
-        const result = await setupGiveaway(guild);
-
-        return interaction.editReply(
-          `Giveaway siap! Rundown: ${result.rundown}. History: ${result.history}. Panel kontrol (khusus Staff): ${result.setting}.`
-        );
-      }
-
-      if (target === 'hook') {
-        const result = await setupHook(guild);
-
-        return interaction.editReply(
-          `Hook siap! Buka panel (khusus Staff): ${result.panel}`
-        );
-      }
-
-      if (target === 'reactionrole') {
-        const result = await setupReactionRole(guild);
-
-        return interaction.editReply(
-          `Reaction role siap! Buka panel (khusus Staff): ${result.panel}`
-        );
-      }
-
-      if (target === 'all') {
-        const result = await setupAll(guild);
-
-        return interaction.editReply(
-          `Setup RY selesai!\n` +
-          `Welcome: ${result.welcome.voice}\n` +
-          `Ticket: ${result.ticket.panel}\n` +
-          `Logs: ${result.ticket.logs}\n` +
-          `Vouches: ${result.vouches}\n` +
-          `Giveaway: ${result.giveaway.setting}\n` +
-          `Hook: ${result.hook.panel}\n` +
-          `Reaction Role: ${result.reactionRole.panel}\n\n` +
-          `Atur permission channel member agar role Verified mendapat akses.`
-        );
-      }
-    } catch (error) {
-      console.error(error);
-
-      return interaction.editReply(
-        'Setup gagal. Periksa izin bot dan console VPS.'
-      );
-    }
-
-    return;
+    return interaction.editReply(`${header}\n${report}${footer}`);
   }
 
   // TES AUDIO WELCOME (MP3)
@@ -3097,7 +3068,7 @@ async function routeHook(interaction) {
 // REACTION ROLE
 // ===============================
 
-const RR_PATH = path.join(ROOT, 'reactionroles.json');
+const RR_PATH = path.join(DATA_DIR, 'reactionroles.json');
 
 let reactionRoles = {};
 
@@ -4010,11 +3981,1232 @@ async function routeReactionRole(interaction) {
 }
 
 // ===============================
+// TICKET (SETTING + PANEL)
+// ===============================
+
+const TICKETS_PATH = path.join(DATA_DIR, 'tickets.json');
+
+let ticketPanels = {};
+
+if (fs.existsSync(TICKETS_PATH)) {
+  try {
+    ticketPanels = JSON.parse(fs.readFileSync(TICKETS_PATH, 'utf8'));
+  } catch (error) {
+    console.error('Gagal membaca tickets.json:', error);
+  }
+}
+
+function saveTicketPanels() {
+  fs.writeFileSync(
+    TICKETS_PATH,
+    JSON.stringify(ticketPanels, null, 2)
+  );
+}
+
+const TICKET_OPTION_LIMIT = 25;
+const TICKET_DEFAULT_WELCOME_TITLE = 'Ticket dibuat';
+const TICKET_DEFAULT_WELCOME_TEXT =
+  'Halo {user}, staff akan membantu kamu. Jelaskan kebutuhanmu di sini.';
+
+function slugify(text) {
+  return (
+    String(text)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9_-]/g, '')
+      .slice(0, 40) || 'ticket'
+  );
+}
+
+// Variabel yang bisa dipakai di teks ticket: {user} {option} {server}
+function fillTicketText(text, vars) {
+  return String(text).replace(
+    /\{(user|option|server)\}/g,
+    (_, key) => vars[key]
+  );
+}
+
+function guildTicketPanels(guildId) {
+  return Object.values(ticketPanels)
+    .filter(panel => panel.guildId === guildId)
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function ticketSettingComponents() {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_new')
+        .setLabel('Buat Setting')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_edit')
+        .setLabel('Edit Setting')
+        .setEmoji('✏️')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_addopt')
+        .setLabel('Tambah Pilihan')
+        .setEmoji('🎫')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_editopt')
+        .setLabel('Edit Pilihan')
+        .setEmoji('📝')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_delopt')
+        .setLabel('Hapus Pilihan')
+        .setEmoji('➖')
+        .setStyle(ButtonStyle.Danger)
+    ),
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_apply')
+        .setLabel('Terapkan')
+        .setEmoji('🚀')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_list')
+        .setLabel('Daftar')
+        .setEmoji('📋')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_panel_del')
+        .setLabel('Hapus Setting')
+        .setEmoji('🗑️')
+        .setStyle(ButtonStyle.Danger)
+    )
+  ];
+}
+
+// /setup ticket: cuma bikin channel panel setting (khusus Staff).
+// Kategori + channel ticket dibuat nanti lewat tombol "Terapkan".
+async function setupTicket(guild, opts = {}) {
+  const cfg = guildConfig(guild.id);
+
+  const staffRole = await getStaffRole(guild, opts);
+
+  const category = await findOrCreateCategory(
+    guild,
+    'RY・TOOLS',
+    cfg.toolsCategoryId
+  );
+
+  const panel = await findOrCreateChannel(
+    guild,
+    '🎫・ticket-setting',
+    ChannelType.GuildText,
+    {
+      knownId: cfg.ticketSettingChannelId,
+      parent: category.id,
+      topic: 'Panel khusus Staff untuk mengatur sistem ticket.',
+      permissionOverwrites: staffOnlyOverwrites(guild, staffRole)
+    }
+  );
+
+  cfg.toolsCategoryId = category.id;
+  cfg.ticketSettingChannelId = panel.id;
+
+  saveConfig();
+
+  if (!(await panelAlreadyPosted(panel, 'ry_tk_panel_new'))) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle('🎫 Ticket Setting — Panel Kontrol')
+      .setDescription(
+        'Atur sistem ticket kamu dari sini. Semua bagian bisa diedit kapan saja.\n\n' +
+        '➕ **Buat Setting** — bikin setting ticket baru (nama, judul, deskripsi panel)\n' +
+        '✏️ **Edit Setting** — ubah teks panel, teks di dalam ticket, nama kategori & channel\n' +
+        '🎫 **Tambah Pilihan** — tambah jenis ticket (misal Order, Bantuan)\n' +
+        '📝 **Edit Pilihan** / ➖ **Hapus Pilihan**\n' +
+        '🚀 **Terapkan** — bot membuat kategori + channel (panel & log) lalu memasang panel. Kalau sudah live, tombol ini menyinkronkan perubahan.\n' +
+        '📋 **Daftar** • 🗑️ **Hapus Setting**\n\n' +
+        'Variabel di teks ticket: `{user}` `{option}` `{server}`'
+      )
+      .setFooter({ text: 'RY Ticket Setting' });
+
+    await panel.send({
+      embeds: [embed],
+      components: ticketSettingComponents()
+    });
+  }
+
+  return { staffRole, category, panel };
+}
+
+function newTicketPanel(guild, user, { name, title, description }) {
+  const slug = slugify(name);
+
+  return {
+    id: randomBytes(4).toString('hex'),
+    guildId: guild.id,
+    name,
+    status: 'draft',
+
+    // Teks panel (pesan yang dilihat member)
+    title,
+    description,
+    footer: 'RY Support System',
+    color: null,
+    image: '',
+
+    // Teks di dalam ticket
+    welcomeTitle: TICKET_DEFAULT_WELCOME_TITLE,
+    welcomeText: TICKET_DEFAULT_WELCOME_TEXT,
+
+    // Nama kategori & channel yang akan dibuat bot
+    categoryName: `RY・${name.toUpperCase()}`.slice(0, 100),
+    panelChannelName: `🎫・${slug}`,
+    logsChannelName: `📑・${slug}-logs`,
+
+    // Pilihan ticket
+    options: [],
+
+    // Diisi setelah "Terapkan"
+    categoryId: null,
+    panelChannelId: null,
+    logsChannelId: null,
+    messageId: null,
+    applied: {},
+
+    createdBy: user.id,
+    createdAt: Date.now()
+  };
+}
+
+function buildTicketPanelEmbed(panel) {
+  const embed = new EmbedBuilder()
+    .setColor(panel.color ?? 0x5865f2)
+    .setTitle(panel.title);
+
+  if (panel.description) embed.setDescription(panel.description);
+  if (panel.footer) embed.setFooter({ text: panel.footer });
+  if (panel.image) embed.setImage(panel.image);
+
+  return embed;
+}
+
+function buildTicketPanelPayload(panel) {
+  const components = [];
+
+  if (panel.options.length) {
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`ry_tk_open:${panel.id}`)
+      .setPlaceholder('Pilih jenis ticket...')
+      .addOptions(
+        panel.options.map(option => ({
+          label: option.label.slice(0, 100),
+          value: option.id,
+          ...(option.description
+            ? { description: option.description.slice(0, 100) }
+            : {}),
+          ...(option.emoji
+            ? { emoji: emojiForComponent(option.emoji) }
+            : {})
+        }))
+      );
+
+    components.push(new ActionRowBuilder().addComponents(menu));
+  }
+
+  return {
+    embeds: [buildTicketPanelEmbed(panel)],
+    components
+  };
+}
+
+function ticketOptionsSummary(panel) {
+  if (!panel.options.length) {
+    return 'Pilihan: _belum ada_';
+  }
+
+  return `Pilihan (${panel.options.length}): ` +
+    panel.options
+      .map(option =>
+        `${option.emoji ? `${emojiDisplay(option.emoji)} ` : ''}${option.label}`
+      )
+      .join(', ');
+}
+
+// Bikin / sinkronkan kategori + channel + pesan panel sesuai setting.
+// Dipakai tombol "Terapkan" dan otomatis tiap setting live diedit.
+async function applyTicketPanel(guild, panel) {
+  if (!panel.options.length) {
+    throw new SetupError(
+      'Tambahkan minimal 1 pilihan ticket dulu (tombol **Tambah Pilihan**).'
+    );
+  }
+
+  const staffRole = currentStaffRole(guild);
+
+  if (!staffRole) {
+    throw new SetupError(
+      'Role Staff belum diatur. Jalankan `/resetup` (atau `/setup ticket`) dulu.'
+    );
+  }
+
+  const applied = panel.applied || (panel.applied = {});
+  const reason = 'Setting ticket RY';
+
+  // 1. Kategori
+  let category = panel.categoryId
+    ? guild.channels.cache.get(panel.categoryId)
+    : null;
+
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    category = await findOrCreateCategory(guild, panel.categoryName);
+    applied.category = panel.categoryName;
+  } else if (applied.category !== panel.categoryName) {
+    await category.setName(panel.categoryName, reason);
+    applied.category = panel.categoryName;
+  }
+
+  // 2. Channel panel (member bisa lihat, tapi cuma bot yang bisa kirim pesan)
+  let panelChannel = panel.panelChannelId
+    ? guild.channels.cache.get(panel.panelChannelId)
+    : null;
+
+  if (!panelChannel || panelChannel.type !== ChannelType.GuildText) {
+    panelChannel = await guild.channels.create({
+      name: panel.panelChannelName,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: 'Pilih jenis ticket untuk membuka ticket privat.',
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.ReadMessageHistory
+          ],
+          deny: [
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.AddReactions
+          ]
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.EmbedLinks,
+            PermissionFlagsBits.ReadMessageHistory
+          ]
+        }
+      ],
+      reason
+    });
+
+    applied.panelChannel = panel.panelChannelName;
+  } else {
+    if (applied.panelChannel !== panel.panelChannelName) {
+      await panelChannel.setName(panel.panelChannelName, reason);
+      applied.panelChannel = panel.panelChannelName;
+    }
+
+    if (panelChannel.parentId !== category.id) {
+      await panelChannel.setParent(category.id, { reason }).catch(() => {});
+    }
+  }
+
+  // 3. Channel log transcript (khusus Staff, soalnya isinya percakapan privat)
+  let logsChannel = panel.logsChannelId
+    ? guild.channels.cache.get(panel.logsChannelId)
+    : null;
+
+  if (!logsChannel || logsChannel.type !== ChannelType.GuildText) {
+    logsChannel = await guild.channels.create({
+      name: panel.logsChannelName,
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: 'Transcript ticket yang sudah ditutup.',
+      permissionOverwrites: staffOnlyOverwrites(guild, staffRole),
+      reason
+    });
+
+    applied.logsChannel = panel.logsChannelName;
+  } else {
+    if (applied.logsChannel !== panel.logsChannelName) {
+      await logsChannel.setName(panel.logsChannelName, reason);
+      applied.logsChannel = panel.logsChannelName;
+    }
+
+    if (logsChannel.parentId !== category.id) {
+      await logsChannel.setParent(category.id, { reason }).catch(() => {});
+    }
+  }
+
+  // 4. Pesan panel: edit kalau masih ada, kirim baru kalau hilang
+  const payload = buildTicketPanelPayload(panel);
+
+  let message = panel.messageId
+    ? await panelChannel.messages.fetch(panel.messageId).catch(() => null)
+    : null;
+
+  if (message) {
+    await message.edit(payload);
+  } else {
+    message = await panelChannel.send(payload);
+  }
+
+  panel.categoryId = category.id;
+  panel.panelChannelId = panelChannel.id;
+  panel.logsChannelId = logsChannel.id;
+  panel.messageId = message.id;
+  panel.status = 'live';
+
+  saveTicketPanels();
+
+  return { category, panelChannel, logsChannel, message };
+}
+
+// Setelah edit: kalau setting sudah live, panel ikut diperbarui
+async function syncLiveTicketPanel(guild, panel) {
+  if (panel.status !== 'live') {
+    return '🟡 Masih draft. Klik **Terapkan** kalau sudah selesai.';
+  }
+
+  try {
+    await applyTicketPanel(guild, panel);
+
+    return '🟢 Panel yang sudah live ikut diperbarui.';
+  } catch (error) {
+    if (!(error instanceof SetupError)) console.error(error);
+
+    return `⚠️ Perubahan tersimpan, tapi panel live gagal diperbarui: ${
+      error instanceof SetupError
+        ? error.message
+        : 'cek izin bot dan console VPS.'
+    }`;
+  }
+}
+
+async function finishTicketEdit(interaction, panel, notice) {
+  saveTicketPanels();
+
+  const syncNote = await syncLiveTicketPanel(interaction.guild, panel);
+
+  return interaction.editReply({
+    content: `${notice}\n${ticketOptionsSummary(panel)}\n${syncNote}`,
+    embeds: [buildTicketPanelEmbed(panel)],
+    allowedMentions: { parse: [] }
+  });
+}
+
+// ---------- Panel setting (khusus Staff) ----------
+
+async function replyTicketPicker(interaction, action, intro) {
+  const panels = guildTicketPanels(interaction.guild.id).slice(0, 25);
+
+  if (!panels.length) {
+    return interaction.reply({
+      content: 'Belum ada setting ticket. Klik **Buat Setting** dulu.',
+      ephemeral: true
+    });
+  }
+
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`ry_tk_pick:${action}`)
+    .setPlaceholder('Pilih setting ticket...')
+    .addOptions(
+      panels.map(panel => ({
+        label: panel.name.slice(0, 100),
+        description:
+          `${panel.status === 'live' ? 'Live' : 'Draft'} • ${panel.options.length} pilihan`,
+        value: panel.id
+      }))
+    );
+
+  return interaction.reply({
+    content: intro,
+    components: [new ActionRowBuilder().addComponents(menu)],
+    ephemeral: true
+  });
+}
+
+function ticketOptionModal(panel, option) {
+  return buildModal(
+    `ry_tk_modal_opt:${option ? option.id : 'new'}:${panel.id}`,
+    option ? 'Edit Pilihan Ticket' : 'Tambah Pilihan Ticket',
+    [
+      textInput({
+        id: 'label',
+        label: 'Nama Pilihan',
+        placeholder: 'Contoh: Pembelian / Order',
+        value: option?.label,
+        max: 100,
+        required: true
+      }),
+      textInput({
+        id: 'emoji',
+        label: 'Emoji (opsional)',
+        placeholder: 'Contoh: 🛒 atau <:nama:123456789012345678>',
+        value: option?.emoji ? emojiDisplay(option.emoji) : '',
+        max: 60
+      }),
+      textInput({
+        id: 'description',
+        label: 'Deskripsi singkat (opsional)',
+        value: option?.description,
+        max: 100
+      }),
+      textInput({
+        id: 'welcome',
+        label: 'Pesan khusus di ticket (opsional)',
+        style: TextInputStyle.Paragraph,
+        placeholder: 'Kosongkan = pakai pesan umum. Variabel: {user} {option} {server}',
+        value: option?.welcome,
+        max: 1000
+      })
+    ]
+  );
+}
+
+async function handleTicketPanelButton(interaction) {
+  switch (interaction.customId) {
+    case 'ry_tk_panel_new':
+      return interaction.showModal(
+        buildModal('ry_tk_modal_new', 'Buat Setting Ticket', [
+          textInput({
+            id: 'name',
+            label: 'Nama Setting',
+            placeholder: 'Contoh: Support',
+            max: 40,
+            required: true
+          }),
+          textInput({
+            id: 'title',
+            label: 'Judul Panel',
+            placeholder: 'Contoh: Ticket Support',
+            max: 100,
+            required: true
+          }),
+          textInput({
+            id: 'description',
+            label: 'Deskripsi Panel',
+            style: TextInputStyle.Paragraph,
+            placeholder: 'Contoh: Pilih kategori untuk membuka ticket privat.',
+            max: 1000
+          })
+        ])
+      );
+
+    case 'ry_tk_panel_edit':
+      return replyTicketPicker(interaction, 'edit', 'Edit setting yang mana?');
+
+    case 'ry_tk_panel_addopt':
+      return replyTicketPicker(interaction, 'addopt', 'Tambah pilihan ke setting yang mana?');
+
+    case 'ry_tk_panel_editopt':
+      return replyTicketPicker(interaction, 'editopt', 'Edit pilihan dari setting yang mana?');
+
+    case 'ry_tk_panel_delopt':
+      return replyTicketPicker(interaction, 'delopt', 'Hapus pilihan dari setting yang mana?');
+
+    case 'ry_tk_panel_apply':
+      return replyTicketPicker(
+        interaction,
+        'apply',
+        'Terapkan setting yang mana? (bot akan membuat kategori + channel, atau menyinkronkan kalau sudah live)'
+      );
+
+    case 'ry_tk_panel_del':
+      return replyTicketPicker(interaction, 'del', 'Hapus setting yang mana?');
+
+    case 'ry_tk_panel_list': {
+      const panels = guildTicketPanels(interaction.guild.id);
+
+      if (!panels.length) {
+        return interaction.reply({
+          content: 'Belum ada setting ticket.',
+          ephemeral: true
+        });
+      }
+
+      const lines = panels.map(panel =>
+        `• **${panel.name}** — ${panel.status === 'live' ? '🟢 live' : '🟡 draft'} — ${panel.options.length} pilihan — kategori: ${panel.categoryName}` +
+        (panel.panelChannelId ? ` — <#${panel.panelChannelId}>` : '')
+      );
+
+      return interaction.reply({
+        content: lines.join('\n').slice(0, 1900),
+        ephemeral: true
+      });
+    }
+  }
+}
+
+// Setting dipilih di menu -> lanjut sesuai aksi
+async function handleTicketPick(interaction) {
+  const action = interaction.customId.split(':')[1];
+  const panel = ticketPanels[interaction.values[0]];
+
+  if (!panel || panel.guildId !== interaction.guild.id) {
+    return interaction.update({
+      content: 'Setting tidak ditemukan.',
+      components: []
+    });
+  }
+
+  if (action === 'edit') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ry_tk_editpart:texts:${panel.id}`)
+        .setLabel('Teks Panel')
+        .setEmoji('📝')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`ry_tk_editpart:welcome:${panel.id}`)
+        .setLabel('Teks di Dalam Ticket')
+        .setEmoji('💬')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`ry_tk_editpart:struct:${panel.id}`)
+        .setLabel('Kategori & Channel')
+        .setEmoji('🏗️')
+        .setStyle(ButtonStyle.Primary)
+    );
+
+    return interaction.update({
+      content: `Edit bagian mana dari **${panel.name}**?`,
+      components: [row]
+    });
+  }
+
+  if (action === 'addopt') {
+    if (panel.options.length >= TICKET_OPTION_LIMIT) {
+      return interaction.update({
+        content: `Setting ini sudah penuh (maksimal ${TICKET_OPTION_LIMIT} pilihan).`,
+        components: []
+      });
+    }
+
+    return interaction.showModal(ticketOptionModal(panel, null));
+  }
+
+  if (action === 'editopt' || action === 'delopt') {
+    if (!panel.options.length) {
+      return interaction.update({
+        content: 'Setting ini belum punya pilihan.',
+        components: []
+      });
+    }
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`ry_tk_pickopt:${action}:${panel.id}`)
+      .setPlaceholder('Pilih pilihan ticket...')
+      .addOptions(
+        panel.options.map(option => ({
+          label: option.label.slice(0, 100),
+          value: option.id,
+          ...(option.emoji
+            ? { emoji: emojiForComponent(option.emoji) }
+            : {})
+        }))
+      );
+
+    return interaction.update({
+      content: action === 'editopt'
+        ? `Edit pilihan mana dari **${panel.name}**?`
+        : `Hapus pilihan mana dari **${panel.name}**?`,
+      components: [new ActionRowBuilder().addComponents(menu)]
+    });
+  }
+
+  if (action === 'apply') {
+    await interaction.deferUpdate();
+
+    try {
+      const result = await applyTicketPanel(interaction.guild, panel);
+
+      return interaction.editReply({
+        content:
+          `🚀 Setting **${panel.name}** diterapkan!\n` +
+          `Kategori: **${result.category.name}**\n` +
+          `Panel: ${result.panelChannel}\n` +
+          `Log: ${result.logsChannel}\n` +
+          `Lihat panel: ${result.message.url}`,
+        components: []
+      });
+    } catch (error) {
+      if (!(error instanceof SetupError)) console.error(error);
+
+      return interaction.editReply({
+        content: `❌ ${
+          error instanceof SetupError
+            ? error.message
+            : 'Gagal menerapkan setting. Periksa izin bot (Manage Channels) dan console VPS.'
+        }`,
+        components: []
+      });
+    }
+  }
+
+  if (action === 'del') {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`ry_tk_delconfirm:${panel.id}`)
+        .setLabel('Ya, hapus')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('ry_tk_delcancel')
+        .setLabel('Batal')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+    return interaction.update({
+      content:
+        `Hapus setting **${panel.name}**? Pesan panelnya ikut dihapus, tapi kategori dan channel yang sudah dibuat **tidak** dihapus.`,
+      components: [row]
+    });
+  }
+}
+
+// Pilihan ticket dipilih -> edit atau hapus
+async function handleTicketPickOpt(interaction) {
+  const [, action, panelId] = interaction.customId.split(':');
+  const panel = ticketPanels[panelId];
+
+  const option = panel?.options.find(
+    item => item.id === interaction.values[0]
+  );
+
+  if (!panel || panel.guildId !== interaction.guild.id || !option) {
+    return interaction.update({
+      content: 'Pilihan tidak ditemukan.',
+      components: []
+    });
+  }
+
+  if (action === 'editopt') {
+    return interaction.showModal(ticketOptionModal(panel, option));
+  }
+
+  // delopt
+  await interaction.deferUpdate();
+
+  panel.options = panel.options.filter(item => item.id !== option.id);
+  saveTicketPanels();
+
+  const syncNote = await syncLiveTicketPanel(interaction.guild, panel);
+
+  return interaction.editReply({
+    content: `✅ Pilihan **${option.label}** dihapus.\n${syncNote}`,
+    components: []
+  });
+}
+
+// Tombol di menu "Edit Setting" -> buka form sesuai bagian
+async function handleTicketEditPart(interaction) {
+  const [, part, panelId] = interaction.customId.split(':');
+  const panel = ticketPanels[panelId];
+
+  if (!panel || panel.guildId !== interaction.guild.id) {
+    return interaction.update({
+      content: 'Setting tidak ditemukan.',
+      components: []
+    });
+  }
+
+  if (part === 'texts') {
+    return interaction.showModal(
+      buildModal(`ry_tk_modal_texts:${panel.id}`, 'Teks Panel', [
+        textInput({
+          id: 'title',
+          label: 'Judul Panel',
+          value: panel.title,
+          max: 100,
+          required: true
+        }),
+        textInput({
+          id: 'description',
+          label: 'Deskripsi Panel',
+          style: TextInputStyle.Paragraph,
+          value: panel.description,
+          max: 1000
+        }),
+        textInput({
+          id: 'footer',
+          label: 'Footer Panel',
+          value: panel.footer,
+          max: 200
+        }),
+        textInput({
+          id: 'color',
+          label: 'Warna (hex, contoh #5865F2)',
+          value: panel.color === null
+            ? ''
+            : `#${panel.color.toString(16).padStart(6, '0')}`,
+          max: 7
+        }),
+        textInput({
+          id: 'image',
+          label: 'URL Gambar Panel (opsional)',
+          value: panel.image,
+          placeholder: 'https://...',
+          max: 500
+        })
+      ])
+    );
+  }
+
+  if (part === 'welcome') {
+    return interaction.showModal(
+      buildModal(`ry_tk_modal_welcome:${panel.id}`, 'Teks di Dalam Ticket', [
+        textInput({
+          id: 'title',
+          label: 'Judul Pesan di Ticket',
+          value: panel.welcomeTitle,
+          max: 100,
+          required: true
+        }),
+        textInput({
+          id: 'text',
+          label: 'Isi Pesan di Ticket',
+          style: TextInputStyle.Paragraph,
+          placeholder: 'Variabel: {user} {option} {server}',
+          value: panel.welcomeText,
+          max: 1500,
+          required: true
+        })
+      ])
+    );
+  }
+
+  if (part === 'struct') {
+    return interaction.showModal(
+      buildModal(`ry_tk_modal_struct:${panel.id}`, 'Kategori & Channel', [
+        textInput({
+          id: 'category',
+          label: 'Nama Kategori Ticket',
+          value: panel.categoryName,
+          max: 100,
+          required: true
+        }),
+        textInput({
+          id: 'panel',
+          label: 'Nama Channel Panel (open ticket)',
+          value: panel.panelChannelName,
+          max: 100,
+          required: true
+        }),
+        textInput({
+          id: 'logs',
+          label: 'Nama Channel Log (transcript)',
+          value: panel.logsChannelName,
+          max: 100,
+          required: true
+        })
+      ])
+    );
+  }
+}
+
+async function handleTicketDeleteConfirm(interaction) {
+  const panelId = interaction.customId.split(':')[1];
+  const panel = ticketPanels[panelId];
+
+  await interaction.deferUpdate();
+
+  if (!panel || panel.guildId !== interaction.guild.id) {
+    return interaction.editReply({
+      content: 'Setting tidak ditemukan.',
+      components: []
+    });
+  }
+
+  const channel = panel.panelChannelId
+    ? interaction.guild.channels.cache.get(panel.panelChannelId)
+    : null;
+
+  if (channel?.isTextBased() && panel.messageId) {
+    const message = await channel.messages
+      .fetch(panel.messageId)
+      .catch(() => null);
+
+    await message?.delete().catch(() => {});
+  }
+
+  delete ticketPanels[panel.id];
+  saveTicketPanels();
+
+  return interaction.editReply({
+    content: `🗑️ Setting **${panel.name}** dihapus. Kategori dan channel-nya masih ada, hapus manual kalau tidak dipakai lagi.`,
+    components: []
+  });
+}
+
+// Semua form (modal) di sistem ticket setting
+async function handleTicketModal(interaction) {
+  const [kind, first, second] = interaction.customId.split(':');
+  const get = id => interaction.fields.getTextInputValue(id).trim();
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const fail = message => interaction.editReply(`❌ ${message}`);
+
+  // Buat setting baru (draft)
+  if (kind === 'ry_tk_modal_new') {
+    const panel = newTicketPanel(interaction.guild, interaction.user, {
+      name: get('name').slice(0, 40),
+      title: get('title').slice(0, 100),
+      description: get('description').slice(0, 1000)
+    });
+
+    ticketPanels[panel.id] = panel;
+
+    return finishTicketEdit(
+      interaction,
+      panel,
+      `✅ Setting **${panel.name}** dibuat sebagai draft.\n` +
+      `Kategori: **${panel.categoryName}** • Panel: ${panel.panelChannelName} • Log: ${panel.logsChannelName}\n` +
+      'Langkah berikutnya: **Tambah Pilihan**, lalu **Terapkan**.'
+    );
+  }
+
+  const panelId = kind === 'ry_tk_modal_opt' ? second : first;
+  const panel = ticketPanels[panelId];
+
+  if (!panel || panel.guildId !== interaction.guild.id) {
+    return fail('Setting ticket tidak ditemukan.');
+  }
+
+  if (kind === 'ry_tk_modal_texts') {
+    const colorText = get('color');
+    const image = get('image');
+    let color = null;
+
+    if (colorText) {
+      color = parseHexColor(colorText);
+
+      if (color === null) {
+        return fail('Warna harus format hex 6 digit, contoh `#5865F2`.');
+      }
+    }
+
+    if (image && !isValidHttpUrl(image)) {
+      return fail('URL gambar tidak valid (harus diawali https://).');
+    }
+
+    panel.title = get('title').slice(0, 100);
+    panel.description = get('description').slice(0, 1000);
+    panel.footer = get('footer').slice(0, 200);
+    panel.color = color;
+    panel.image = image;
+
+    return finishTicketEdit(interaction, panel, '✅ Teks panel disimpan.');
+  }
+
+  if (kind === 'ry_tk_modal_welcome') {
+    panel.welcomeTitle = get('title').slice(0, 100);
+    panel.welcomeText = get('text').slice(0, 1500);
+
+    const sample = fillTicketText(panel.welcomeText, {
+      user: '@kamu',
+      option: panel.options[0]?.label || 'Contoh',
+      server: interaction.guild.name
+    });
+
+    return finishTicketEdit(
+      interaction,
+      panel,
+      `✅ Teks di dalam ticket disimpan (berlaku untuk ticket baru).\n**${panel.welcomeTitle}**\n${sample}`.slice(0, 1800)
+    );
+  }
+
+  if (kind === 'ry_tk_modal_struct') {
+    panel.categoryName = get('category').slice(0, 100);
+    panel.panelChannelName = get('panel').slice(0, 100);
+    panel.logsChannelName = get('logs').slice(0, 100);
+
+    return finishTicketEdit(
+      interaction,
+      panel,
+      '✅ Nama kategori & channel disimpan.'
+    );
+  }
+
+  if (kind === 'ry_tk_modal_opt') {
+    const emoji = parseEmoji(get('emoji'));
+
+    if (emoji && !emoji.id && !UNICODE_EMOJI_REGEX.test(emoji.name)) {
+      return fail('Emoji tidak valid. Pakai emoji biasa (🛒) atau emoji custom server (<:nama:id>).');
+    }
+
+    const data = {
+      label: get('label').slice(0, 100),
+      emoji: emoji || null,
+      description: get('description').slice(0, 100),
+      welcome: get('welcome').slice(0, 1000)
+    };
+
+    if (first === 'new') {
+      if (panel.options.length >= TICKET_OPTION_LIMIT) {
+        return fail(`Maksimal ${TICKET_OPTION_LIMIT} pilihan per setting.`);
+      }
+
+      panel.options.push({ id: randomBytes(3).toString('hex'), ...data });
+
+      return finishTicketEdit(
+        interaction,
+        panel,
+        `✅ Pilihan **${data.label}** ditambahkan.`
+      );
+    }
+
+    const option = panel.options.find(item => item.id === first);
+
+    if (!option) return fail('Pilihan tidak ditemukan.');
+
+    Object.assign(option, data);
+
+    return finishTicketEdit(
+      interaction,
+      panel,
+      `✅ Pilihan **${data.label}** diperbarui.`
+    );
+  }
+}
+
+// ---------- Membuka ticket (dipakai member) ----------
+
+async function handleTicketOpen(interaction) {
+  const panelId = interaction.customId.split(':')[1];
+  const panel = ticketPanels[panelId];
+
+  const option = panel?.options.find(
+    item => item.id === interaction.values[0]
+  );
+
+  const guild = interaction.guild;
+  const member = interaction.member;
+
+  if (!panel || panel.status !== 'live' || !option) {
+    return interaction.reply({
+      content: 'Panel ticket ini sudah tidak aktif.',
+      ephemeral: true
+    });
+  }
+
+  const category = guild.channels.cache.get(panel.categoryId);
+  const staffRole = currentStaffRole(guild);
+
+  if (!category || !staffRole) {
+    return interaction.reply({
+      content: 'Sistem ticket belum siap. Hubungi admin.',
+      ephemeral: true
+    });
+  }
+
+  const lockKey = `${guild.id}:${member.id}`;
+
+  if (ticketCreateLocks.has(lockKey)) {
+    return interaction.reply({
+      content: 'Ticket sedang diproses.',
+      ephemeral: true
+    });
+  }
+
+  ticketCreateLocks.add(lockKey);
+
+  try {
+    const existing = guild.channels.cache.find(
+      channel =>
+        channel.parentId === category.id &&
+        channel.topic?.includes(`ticket-owner:${member.id}`)
+    );
+
+    if (existing) {
+      return interaction.reply({
+        content: `Kamu masih punya ticket terbuka: ${existing}`,
+        ephemeral: true
+      });
+    }
+
+    const ticketChannel = await guild.channels.create({
+      name: `ticket-${slugify(option.label)}-${member.user.username}`
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-')
+        .slice(0, 90),
+
+      type: ChannelType.GuildText,
+      parent: category.id,
+      topic: `ticket-owner:${member.id}; panel:${panel.id}; kategori:${option.label}`.slice(0, 1000),
+
+      permissionOverwrites: [
+        {
+          id: guild.roles.everyone.id,
+          deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+          id: member.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles
+          ]
+        },
+        {
+          id: staffRole.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.ManageMessages
+          ]
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+            PermissionFlagsBits.AttachFiles,
+            PermissionFlagsBits.ManageChannels
+          ]
+        }
+      ]
+    });
+
+    const text = fillTicketText(option.welcome || panel.welcomeText, {
+      user: `${member}`,
+      option: option.label,
+      server: guild.name
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(panel.color ?? 0x5865f2)
+      .setTitle(panel.welcomeTitle)
+      .setDescription(text.slice(0, 4000))
+      .addFields({
+        name: 'Kategori',
+        value: option.label.slice(0, 1024)
+      })
+      .setTimestamp();
+
+    const buttons = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId('ry_ticket_claim')
+        .setLabel('Claim Ticket')
+        .setStyle(ButtonStyle.Primary),
+
+      new ButtonBuilder()
+        .setCustomId('ry_ticket_close')
+        .setLabel('Tutup Ticket')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    await ticketChannel.send({
+      content: `${member} <@&${staffRole.id}>`,
+      embeds: [embed],
+      components: [buttons],
+      allowedMentions: {
+        users: [member.id],
+        roles: [staffRole.id]
+      }
+    });
+
+    return interaction.reply({
+      content: `Ticket berhasil dibuat: ${ticketChannel}`,
+      ephemeral: true
+    });
+  } finally {
+    ticketCreateLocks.delete(lockKey);
+  }
+}
+
+// Channel log tempat transcript dikirim (dari setting ticket yang bersangkutan)
+function ticketLogsChannel(channel) {
+  const panelId = channel.topic?.match(/panel:([a-f0-9]{8})/)?.[1];
+  const panel = panelId ? ticketPanels[panelId] : null;
+
+  // Cadangan untuk ticket dari sistem lama
+  const logsId =
+    panel?.logsChannelId ||
+    guildConfig(channel.guild.id).ticketLogsChannelId;
+
+  return logsId ? channel.guild.channels.cache.get(logsId) : null;
+}
+
+async function routeTicket(interaction) {
+  const id = interaction.customId;
+
+  if (typeof id !== 'string' || !id.startsWith('ry_tk_')) {
+    return false;
+  }
+
+  // Dipakai member biasa (tanpa cek Staff)
+  if (interaction.isStringSelectMenu() && id.startsWith('ry_tk_open:')) {
+    await handleTicketOpen(interaction);
+    return true;
+  }
+
+  // Selebihnya khusus admin / Staff
+  if (!isStaff(interaction.member)) {
+    await interaction.reply({
+      content: 'Fitur ini hanya untuk admin atau Staff.',
+      ephemeral: true
+    });
+
+    return true;
+  }
+
+  if (interaction.isButton()) {
+    if (id.startsWith('ry_tk_editpart:')) {
+      await handleTicketEditPart(interaction);
+    } else if (id.startsWith('ry_tk_delconfirm:')) {
+      await handleTicketDeleteConfirm(interaction);
+    } else if (id === 'ry_tk_delcancel') {
+      await interaction.update({ content: 'Dibatalkan.', components: [] });
+    } else {
+      await handleTicketPanelButton(interaction);
+    }
+
+    return true;
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    if (id.startsWith('ry_tk_pick:')) {
+      await handleTicketPick(interaction);
+    } else if (id.startsWith('ry_tk_pickopt:')) {
+      await handleTicketPickOpt(interaction);
+    }
+
+    return true;
+  }
+
+  if (interaction.isModalSubmit()) {
+    await handleTicketModal(interaction);
+    return true;
+  }
+
+  return true;
+}
+
+// ===============================
 // BOT READY
 // ===============================
 
 client.once('ready', () => {
   console.log(`RY aktif sebagai ${client.user.tag}`);
+  console.log(`Data tersimpan di: ${DATA_DIR}`);
+
+  const legacyConfig = path.join(ROOT, 'config.json');
+
+  if (
+    legacyConfig !== CONFIG_PATH &&
+    fs.existsSync(legacyConfig) &&
+    !fs.existsSync(CONFIG_PATH)
+  ) {
+    console.warn(
+      `PERINGATAN: ada config.json lama di ${legacyConfig}. Pindahkan config.json (dan giveaways.json / reactionroles.json kalau ada) ke ${DATA_DIR}, atau jalankan /resetup.`
+    );
+  }
 
   const audioPath = resolveWelcomeAudio();
 
@@ -4089,15 +5281,17 @@ client.on('interactionCreate', async interaction => {
     // Hook (embed builder) dan Reaction Role
     if (await routeHook(interaction)) return;
     if (await routeReactionRole(interaction)) return;
+    if (await routeTicket(interaction)) return;
 
+    // Panel ticket versi lama sudah diganti sistem Ticket Setting
     if (
       interaction.isStringSelectMenu() &&
       interaction.customId === 'ry_ticket_category'
     ) {
-      await createTicket(
-        interaction,
-        interaction.values[0]
-      );
+      await interaction.reply({
+        content: 'Panel ticket ini versi lama dan sudah tidak aktif. Minta admin membuat panel baru lewat channel ticket-setting.',
+        ephemeral: true
+      });
 
       return;
     }
